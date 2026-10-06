@@ -16,8 +16,8 @@ collect:
 connectivity:
   test_url: "http://www.gstatic.com/generate_204"
   timeout_ms: 5000
-  rounds: 3              # 测几轮延迟
-  min_pass: 2            # 至少成功几轮才算可用
+  rounds: 4              # 测几轮延迟
+  min_pass: 3            # 至少成功几轮才算可用（4 过 3：淘汰一测就抖的）
   concurrency: 32
 
 purity:

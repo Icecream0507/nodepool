@@ -70,16 +70,16 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
         stats[label] += 1
 
     all_names = [p["name"] for p in proxies]
+    # lazy:false + 较短 interval：客户端持续健康检查，自动绕开刚死掉的节点
+    ut = {"type": "url-test", "url": TEST_URL, "interval": 180, "tolerance": 50, "lazy": False}
     groups = [
         {"name": g_select, "type": "select",
          "proxies": [g_auto] + [lbl for _, _, lbl in tiers if tier_members[lbl]] + ["DIRECT"]},
-        {"name": g_auto, "type": "url-test", "url": TEST_URL, "interval": 300,
-         "tolerance": 50, "proxies": all_names or ["DIRECT"]},
+        {"name": g_auto, **ut, "proxies": all_names or ["DIRECT"]},
     ]
     for _, _, lbl in tiers:
         if tier_members[lbl]:
-            groups.append({"name": lbl, "type": "url-test", "url": TEST_URL,
-                           "interval": 300, "proxies": tier_members[lbl]})
+            groups.append({"name": lbl, **ut, "proxies": tier_members[lbl]})
 
     config = {
         "mixed-port": 7890,
