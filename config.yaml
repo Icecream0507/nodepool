@@ -1,0 +1,56 @@
+# nodepool 配置。改完直接再跑 python update.py 生效。
+
+# 访问 GitHub / gist 用的代理（你的客户端系统代理端口）。
+# 置空字符串则直连。
+proxy: "http://127.0.0.1:3182"
+
+search:
+  query: "vless://"      # gist 全文搜索关键词
+  pages: 10              # 翻几页（每页约 10 个 gist）
+  page_delay: 2.0        # 翻页间隔秒数，别调太小以免被限流
+
+collect:
+  min_nodes_per_gist: 3  # 单个 gist 节点数少于此值则跳过（多半是个人自建配置误公开）
+  max_candidates: 600    # 单次测试的候选节点上限（去重后，含历史池；越大越慢但找到越多）
+
+connectivity:
+  test_url: "http://www.gstatic.com/generate_204"
+  timeout_ms: 5000
+  rounds: 3              # 测几轮延迟
+  min_pass: 2            # 至少成功几轮才算可用
+  concurrency: 32
+
+purity:
+  api: "https://my.ippure.com/v1/info"
+  max_score: 40          # IPPure 系数上限，超过则丢弃
+  cache_hours: 24        # 同一节点/出口 IP 在此时间内不重复查询
+  concurrency: 4         # 同时查询数（对 ippure 温和一点）
+  stagger: 0.4           # 每次请求之间最小间隔秒数
+  request_timeout: 15
+  # 分级：[下限, 上限, 名称]，按 ippure 官方刻度
+  tiers:
+    - [0, 15, "极度纯净"]
+    - [15, 25, "纯净"]
+    - [25, 40, "中性"]
+
+pool:
+  max_fail: 3            # 连续多少次运行都失败就从池中删除
+  max_size: 20000        # 节点池总量上限，超出时优先淘汰从未连通的旧节点
+  stale_days: 3          # 从未连通且超过此天数未再出现的节点直接清理
+
+mihomo:
+  controller: "127.0.0.1:19090"
+  secret: "nodepool"     # 本地 external-controller 密钥
+  base_listen_port: 20000  # 纯净度探测用的起始监听端口
+  startup_timeout: 20
+
+output:
+  file: "output/clash.yaml"
+  # 生成订阅里给代理组起的名字
+  group_auto: "♻️ 自动选择"
+  group_select: "🔰 手动选择"
+
+publish:
+  enabled: true                 # 有 token 就自动发布到 secret gist
+  gist_filename: "clash.yaml"
+  gist_description: "nodepool auto-updated clash subscription"

@@ -1,0 +1,42 @@
+name: update-nodes
+
+on:
+  schedule:
+    - cron: "7 */3 * * *"   # 每 3 小时（UTC；时刻不保证精确，GitHub 可能延迟几分钟）
+  workflow_dispatch: {}      # 支持手动触发
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-nodes
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install requests pyyaml
+
+      # 跨运行保留节点池/纯净度缓存（尽力而为；丢了也不影响订阅链接）
+      - name: Restore pool cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: nodepool-data-${{ github.run_id }}
+          restore-keys: |
+            nodepool-data-
+
+      - name: Run update (直连，云端无需代理)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          NODEPOOL_GIST_ID: ${{ secrets.GIST_ID }}
+        run: python update.py --proxy ""
