@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import io
+import hashlib
 import os
 import platform
 import re
 import subprocess
+import secrets
+import socket
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -21,6 +25,7 @@ import requests
 import yaml
 
 from .util import get_with_retry, log
+from .pool import purity_from_api
 
 RELEASE_API = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
 
@@ -66,18 +71,32 @@ def ensure_binary(root: Path, session: requests.Session) -> Path:
     if not pick:
         raise RuntimeError(f"未找到合适的 {system}-{arch} 资产：{list(names)[:8]}")
     log.info("  下载 %s", pick)
-    rr = session.get(names[pick], timeout=180)
+    rr = get_with_retry(session, names[pick], tries=3, timeout=180)
+    if rr is None:
+        raise RuntimeError("mihomo 内核下载失败")
     rr.raise_for_status()
+    asset = next(a for a in r.json()["assets"] if a["name"] == pick)
+    digest = asset.get("digest") or ""
+    if digest.startswith("sha256:") and hashlib.sha256(rr.content).hexdigest() != digest[7:]:
+        raise RuntimeError("mihomo 下载文件校验失败")
     if pick.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(rr.content)) as z:
             member = next(m for m in z.namelist() if m.endswith(".exe"))
-            with z.open(member) as src, open(target, "wb") as dst:
-                dst.write(src.read())
+            binary = z.read(member)
     else:  # .gz
         import gzip
-        with open(target, "wb") as dst:
-            dst.write(gzip.decompress(rr.content))
-        target.chmod(0o755)
+        binary = gzip.decompress(rr.content)
+    fd, tmp = tempfile.mkstemp(prefix="mihomo_", suffix=target.suffix, dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as dst:
+            dst.write(binary)
+        if system != "windows":
+            os.chmod(tmp, 0o755)
+        subprocess.run([tmp, "-v"], check=True, capture_output=True, timeout=10)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     log.info("  内核已保存：%s", target)
     return target
 
@@ -89,37 +108,52 @@ class Mihomo:
                  startup_timeout: int = 20):
         self.exe = exe
         self.controller = controller
-        self.secret = secret
+        self.secret = secrets.token_urlsafe(24)
         self.startup_timeout = startup_timeout
-        self._dir = tempfile.mkdtemp(prefix="mihomo_")
+        self._temp = tempfile.TemporaryDirectory(prefix="mihomo_")
+        self._dir = self._temp.name
         self._cfg_path = os.path.join(self._dir, "config.yaml")
         with open(self._cfg_path, "w", encoding="utf-8") as f:
-            f.write(cfg_text)
+            config = yaml.safe_load(cfg_text)
+            config["secret"] = self.secret
+            f.write(yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
         self._proc: subprocess.Popen | None = None
         self.base = f"http://{controller}"
         self.sess = requests.Session()
         self.sess.trust_env = False
-        self.sess.headers["Authorization"] = f"Bearer {secret}"
+        self.sess.headers["Authorization"] = f"Bearer {self.secret}"
+        self._log = None
 
     def __enter__(self):
-        self._proc = subprocess.Popen(
-            [str(self.exe), "-f", self._cfg_path, "-d", self._dir],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace",
-        )
-        deadline = time.time() + self.startup_timeout
-        while time.time() < deadline:
-            if self._proc.poll() is not None:
-                out = self._proc.stdout.read() if self._proc.stdout else ""
-                raise RuntimeError(f"mihomo 启动即退出：\n{out[-1500:]}")
-            try:
-                r = self.sess.get(self.base + "/version", timeout=2)
-                if r.status_code == 200:
-                    log.info("  mihomo 已就绪 %s", r.json().get("version", ""))
-                    return self
-            except requests.RequestException:
-                time.sleep(0.3)
-        self._read_tail_and_raise()
+        try:
+            from urllib.parse import urlparse
+            address = urlparse(self.base)
+            with socket.socket(socket.AF_INET6 if ":" in address.hostname else socket.AF_INET) as check:
+                check.bind((address.hostname, address.port))
+            self._log = open(os.path.join(self._dir, "mihomo.log"), "w+b")
+            self._proc = subprocess.Popen(
+                [str(self.exe), "-f", self._cfg_path, "-d", self._dir],
+                stdout=self._log, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            deadline = time.monotonic() + self.startup_timeout
+            while time.monotonic() < deadline:
+                if self._proc.poll() is not None:
+                    self._log.seek(0)
+                    out = self._log.read().decode("utf-8", "replace")
+                    raise RuntimeError(f"mihomo 启动即退出：\n{out[-1500:]}")
+                try:
+                    r = self.sess.get(self.base + "/version", timeout=1)
+                    if r.status_code == 200 and self._proc.poll() is None:
+                        log.info("  mihomo 已就绪 %s", r.json().get("version", ""))
+                        return self
+                except (requests.RequestException, ValueError):
+                    pass
+                time.sleep(0.2)
+            raise RuntimeError("mihomo 控制接口未在超时内就绪")
+        except BaseException:
+            self.stop()
+            raise
 
     def _read_tail_and_raise(self):
         self.stop()
@@ -135,7 +169,13 @@ class Mihomo:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+                self._proc.wait(timeout=5)
         self._proc = None
+        self.sess.close()
+        if self._log:
+            self._log.close()
+            self._log = None
+        self._temp.cleanup()
 
     # ---- API ----
     def delay(self, name: str, url: str, timeout_ms: int) -> int | None:
@@ -167,15 +207,13 @@ _BASE_CFG = {
 
 def prune_invalid(exe: Path, proxies: list[dict], controller: str, secret: str,
                   timeout: int, max_drops: int = 400) -> list[dict]:
-    """逐个剔除 mihomo 拒绝解析的非法节点，直到配置能启动。"""
+    """使用配置检查剔除非法节点；不反复启动监听服务。"""
     proxies = list(proxies)
     drops = 0
     while drops < max_drops:
         text = build_test_config(proxies, controller, secret)
         try:
-            m = Mihomo(exe, text, controller, secret, timeout)
-            m.__enter__()
-            m.stop()
+            check_config(exe, text, timeout)
             if drops:
                 log.info("  剔除无法解析的节点 %d 个", drops)
             return proxies
@@ -186,8 +224,38 @@ def prune_invalid(exe: Path, proxies: list[dict], controller: str, secret: str,
                 drops += 1
                 continue
             raise
-    log.warning("  剔除非法节点已达上限 %d", max_drops)
-    return proxies
+    raise RuntimeError(f"剔除非法节点已达上限 {max_drops}，停止使用未校验的配置")
+
+
+def check_config(exe: Path, text: str, timeout: int = 20) -> None:
+    with tempfile.TemporaryDirectory(prefix="mihomo_check_") as td:
+        path = Path(td) / "config.yaml"
+        path.write_text(text, encoding="utf-8")
+        try:
+            r = subprocess.run([str(exe), "-t", "-f", str(path), "-d", td],
+                               capture_output=True, timeout=timeout,
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("mihomo 配置检查超时") from exc
+        if r.returncode:
+            message = (r.stdout + r.stderr).decode("utf-8", "replace")
+            index = re.search(r"proxy (\d+)", message)
+            detail = f"proxy {index.group(1)} 无法解析" if index else "配置或内核无法使用"
+            raise RuntimeError(f"mihomo 配置检查失败：{detail}")
+
+
+def validate_subscription(exe: Path, text: str, timeout: int = 20) -> None:
+    config = yaml.safe_load(text)
+    if not config.get("proxies"):
+        raise RuntimeError("拒绝生成空订阅")
+    # GEOIP 数据由客户端管理；离线校验不触发数据库下载。
+    config["rules"] = [r for r in config["rules"] if not r.startswith(("GEOIP,", "GEOSITE,"))]
+    config["geodata-mode"] = False
+    config["geo-auto-update"] = False
+    if config.get("dns", {}).get("fallback"):
+        # DNS fallback 默认也会加载 GeoIP，即使 rules 中没有 GEOIP。
+        config["dns"].setdefault("fallback-filter", {})["geoip"] = False
+    check_config(exe, yaml.safe_dump(config, allow_unicode=True, sort_keys=False), timeout)
 
 
 def build_test_config(proxies: list[dict], controller: str, secret: str) -> str:
@@ -242,6 +310,8 @@ def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, li
     mc = cfg["mihomo"]
     text = build_test_config(proxies, mc["controller"], mc["secret"])
     results: dict[str, list] = {p["name"]: [] for p in proxies}
+    if not proxies:
+        return results
     with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])) as m:
         for rnd in range(1, rounds + 1):
             ok = 0
@@ -261,7 +331,21 @@ def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, li
 
 def probe_purity(exe: Path, proxies: list[dict], cfg: dict,
                  on_result=None) -> dict[str, dict]:
-    """通过每个节点访问 ippure，返回 {name: {ip,fraudScore,...}}。"""
+    """小批次检测、及时回写；只缓存包含有效评分的对象。"""
+    out = {}
+    size = int(cfg["purity"].get("batch_size", 32))
+    deadline = time.monotonic() + cfg["purity"].get("max_seconds", 420)
+    for start in range(0, len(proxies), size):
+        if time.monotonic() >= deadline:
+            log.warning("纯净度时间预算已到，未测节点留待下次运行")
+            break
+        batch = proxies[start:start + size]
+        out.update(_probe_batch(exe, batch, cfg, on_result))
+        log.info("  纯净度进度 %d/%d，有效结果 %d", min(start + size, len(proxies)), len(proxies), len(out))
+    return out
+
+
+def _probe_batch(exe: Path, proxies: list[dict], cfg: dict, on_result=None) -> dict[str, dict]:
     pc = cfg["purity"]
     mc = cfg["mihomo"]
     api = pc["api"]
@@ -283,24 +367,26 @@ def probe_purity(exe: Path, proxies: list[dict], cfg: dict,
                                          int(mc["base_listen_port"]), hosts=hosts)
     out: dict[str, dict] = {}
     lock_time = [0.0]
+    rate_lock = threading.Lock()
 
     def one(name: str) -> tuple[str, dict | None]:
         port = port_map[name]
-        s = requests.Session()
-        s.trust_env = False
-        prox = f"http://127.0.0.1:{port}"
-        s.proxies = {"http": prox, "https": prox}
-        for attempt in range(2):
-            try:
-                r = s.get(api, timeout=rtmo)
-                if r.status_code == 200:
-                    data = r.json()
-                    # 拿到 JSON 但没有系数（通常是 IPv6 出口）——重试一次
-                    if data.get("fraudScore") is None and attempt == 0:
-                        continue
-                    return name, data
-            except (requests.RequestException, ValueError):
-                pass
+        with requests.Session() as s:
+            s.trust_env = False
+            prox = f"http://127.0.0.1:{port}"
+            s.proxies = {"http": prox, "https": prox}
+            for attempt in range(2):
+                with rate_lock:
+                    time.sleep(max(0, lock_time[0] - time.monotonic()))
+                    lock_time[0] = time.monotonic() + stagger
+                try:
+                    r = s.get(api, timeout=rtmo)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if purity_from_api(data) is not None:
+                            return name, data
+                except (requests.RequestException, ValueError):
+                    pass
         return name, None
 
     with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])) as m:
@@ -308,16 +394,12 @@ def probe_purity(exe: Path, proxies: list[dict], cfg: dict,
         with cf.ThreadPoolExecutor(max_workers=conc) as ex:
             futs = []
             for name in names:
-                # 轻微错峰，避免对 ippure 瞬时并发过高
-                gap = max(0.0, lock_time[0] - time.time())
-                time.sleep(gap)
-                lock_time[0] = time.time() + stagger
                 futs.append(ex.submit(one, name))
             done = 0
             for fut in cf.as_completed(futs):
                 name, data = fut.result()
                 done += 1
-                if data and "fraudScore" in data:
+                if data:
                     out[name] = data
                     if on_result:
                         on_result(name, data)

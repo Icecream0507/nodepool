@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid as uuid_module
 from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
@@ -58,7 +59,7 @@ def _transport_opts(p: dict, net: str, q: dict, *, ws_path_key="path", host_key=
     net = (net or "tcp").lower()
     if net in ("ws", "websocket"):
         p["network"] = "ws"
-        path = unquote(_qget(q, ws_path_key, "path", default="/"))
+        path = _qget(q, ws_path_key, "path", default="/")
         host = _qget(q, host_key, "host")
         opts = {"path": path or "/"}
         if host:
@@ -67,11 +68,11 @@ def _transport_opts(p: dict, net: str, q: dict, *, ws_path_key="path", host_key=
     elif net == "grpc":
         p["network"] = "grpc"
         svc = _qget(q, grpc_key, "serviceName", "servicename")
-        p["grpc-opts"] = {"grpc-service-name": unquote(svc)} if svc else {}
+        p["grpc-opts"] = {"grpc-service-name": svc} if svc else {}
     elif net in ("h2", "http"):
         p["network"] = "h2"
         host = _qget(q, host_key, "host")
-        path = unquote(_qget(q, ws_path_key, "path", default="/"))
+        path = _qget(q, ws_path_key, "path", default="/")
         opts = {"path": path or "/"}
         if host:
             opts["host"] = [host]
@@ -119,8 +120,12 @@ def parse_vless(uri: str) -> dict | None:
         if pbk:
             ro["public-key"] = pbk
         # short-id 必须是 16 进制且不超过 16 字符，否则 mihomo 拒绝解析——非法就丢弃
-        if sid and re.fullmatch(r"[0-9a-fA-F]{1,16}", sid):
+        if sid:
+            if not re.fullmatch(r"(?:[0-9a-fA-F]{2}){1,8}", sid):
+                return None
             ro["short-id"] = sid
+        if not pbk:
+            return None
         if ro:
             p["reality-opts"] = ro
         if not fp:
@@ -212,11 +217,14 @@ def parse_ss(uri: str) -> dict | None:
     if "#" in body:
         body, frag = body.split("#", 1)
         name = _name(frag, "")
+    body, _, query = body.partition("?")
+    q = parse_qs(query)
     # 形式 A: base64(method:pass)@host:port
     # 形式 B: base64(method:pass@host:port)
     host = port = method = password = None
     if "@" in body:
         userinfo, hostpart = body.rsplit("@", 1)
+        plain_userinfo = ":" in userinfo
         # userinfo 可能是 base64
         if ":" not in userinfo:
             dec = try_b64decode(userinfo) or ""
@@ -229,7 +237,7 @@ def parse_ss(uri: str) -> dict | None:
                     return None
         if ":" not in userinfo:
             return None
-        method, password = userinfo.split(":", 1)
+        method, password = (unquote(userinfo) if plain_userinfo else userinfo).split(":", 1)
         hostpart = hostpart.split("/")[0].split("?")[0]
         if ":" not in hostpart:
             return None
@@ -251,8 +259,56 @@ def parse_ss(uri: str) -> dict | None:
         return None
     if not host or not method or password is None:
         return None
-    return {"name": name or f"ss-{host}", "type": "ss", "server": host,
-            "port": port, "cipher": method.strip(), "password": password, "udp": True}
+    p = {"name": name or f"ss-{host}", "type": "ss", "server": host,
+         "port": port, "cipher": method.strip(), "password": password, "udp": True}
+    plugin = _qget(q, "plugin")
+    if plugin:
+        pieces = plugin.split(";")
+        opts = dict(piece.split("=", 1) if "=" in piece else (piece, True) for piece in pieces[1:] if piece)
+        if pieces[0] in ("obfs-local", "simple-obfs"):
+            p["plugin"] = "obfs"
+            p["plugin-opts"] = {"mode": opts.get("obfs", "http"), "host": opts.get("obfs-host", "")}
+        elif pieces[0] == "v2ray-plugin":
+            p["plugin"] = "v2ray-plugin"
+            p["plugin-opts"] = {"mode": opts.get("mode", "websocket"),
+                                "tls": "tls" in opts, "host": opts.get("host", ""), "path": opts.get("path", "/")}
+        else:
+            return None
+    return p
+
+
+def parse_ssr(uri: str) -> dict | None:
+    body = _b64_to_text(uri.split("://", 1)[1])
+    main, _, query = body.partition("/?")
+    host, port, protocol, cipher, obfs, password = main.rsplit(":", 5)
+    q = parse_qs(query)
+    p = {"name": _b64_to_text(_qget(q, "remarks")) or f"ssr-{host}",
+         "type": "ssr", "server": host.strip("[]"), "port": int(port),
+         "protocol": protocol, "cipher": cipher, "obfs": obfs,
+         "password": _b64_to_text(password), "udp": True}
+    for key, target in (("protoparam", "protocol-param"), ("obfsparam", "obfs-param")):
+        if _qget(q, key):
+            p[target] = _b64_to_text(_qget(q, key))
+    return p
+
+
+def parse_hysteria(uri: str) -> dict | None:
+    u = urlparse(uri)
+    q = parse_qs(u.query)
+    if not u.hostname:
+        return None
+    p = {"name": _name(u.fragment, f"hy-{u.hostname}"), "type": "hysteria",
+         "server": u.hostname, "port": u.port or 443,
+         "auth-str": _qget(q, "auth") or unquote(u.username or ""),
+         "up": _qget(q, "upmbps", "up", default="10"),
+         "down": _qget(q, "downmbps", "down", default="50")}
+    if _qget(q, "peer", "sni"):
+        p["sni"] = _qget(q, "peer", "sni")
+    if _truthy(_qget(q, "insecure")):
+        p["skip-cert-verify"] = True
+    if _qget(q, "obfsParam", "obfs"):
+        p["obfs"] = _qget(q, "obfsParam", "obfs")
+    return p
 
 
 def parse_hysteria2(uri: str) -> dict | None:
@@ -323,15 +379,16 @@ def parse_anytls(uri: str) -> dict | None:
     sni = _qget(q, "sni", "servername", "peer")
     if sni:
         p["sni"] = sni
-    if _truthy(_qget(q, "insecure", "allowInsecure", "tls-verification") or
-               ("false" == _qget(q, "tls-verification").lower())):
+    if (_truthy(_qget(q, "insecure", "allowInsecure"))
+            or _qget(q, "tls-verification").lower() in ("false", "0", "no", "off")):
         p["skip-cert-verify"] = True
     return p
 
 
 _DISPATCH = {
     "vless": parse_vless, "vmess": parse_vmess, "trojan": parse_trojan,
-    "ss": parse_ss, "hysteria2": parse_hysteria2, "hy2": parse_hysteria2,
+    "ss": parse_ss, "ssr": parse_ssr, "hysteria": parse_hysteria,
+    "hysteria2": parse_hysteria2, "hy2": parse_hysteria2,
     "tuic": parse_tuic, "anytls": parse_anytls,
 }
 
@@ -343,9 +400,9 @@ def parse_uri(uri: str) -> dict | None:
         return None
     try:
         p = fn(uri.strip())
+        return p if validate(p) else None
     except Exception:
         return None
-    return p if validate(p) else None
 
 
 # ---------------------------------------------------------------- YAML 提取
@@ -369,9 +426,12 @@ def lift_yaml_proxies(text: str) -> list[dict]:
     for p in proxies:
         if not isinstance(p, dict):
             continue
-        p = _normalize_yaml_proxy(p)
-        if validate(p):
-            out.append(p)
+        try:
+            p = _normalize_yaml_proxy(p)
+            if validate(p):
+                out.append(p)
+        except (TypeError, ValueError, OverflowError):
+            continue
     return out
 
 
@@ -392,27 +452,38 @@ def validate(p: dict | None) -> bool:
     if not isinstance(p, dict):
         return False
     t = p.get("type")
-    if t not in KNOWN_TYPES:
+    if not isinstance(t, str) or t not in KNOWN_TYPES:
         return False
-    host = str(p.get("server", ""))
+    host = p.get("server")
+    if not isinstance(host, str) or not host.strip() or any(c.isspace() for c in host):
+        return False
     if is_bogus_host(host):
         return False
     try:
+        if isinstance(p.get("port"), bool):
+            return False
         port = int(p.get("port"))
     except (TypeError, ValueError):
         return False
     if not (0 < port < 65536):
         return False
     # 占位 uuid / 空凭据
-    cred = p.get("uuid") or p.get("password")
     if t in ("vless", "vmess", "tuic") and not p.get("uuid"):
         return False
+    if t in ("vless", "vmess", "tuic"):
+        try:
+            p["uuid"] = str(uuid_module.UUID(str(p["uuid"])))
+        except ValueError:
+            # 部分内核支持非标准用户 ID，交由 mihomo 实际校验。
+            pass
     if t == "vless" and str(p.get("uuid")).replace("-", "") == "0" * 32:
         return False
-    if t in ("trojan", "ss", "hysteria2", "anytls") and not (p.get("password") is not None and
+    if t in ("trojan", "ss", "ssr", "hysteria2", "anytls") and not (p.get("password") is not None and
                                                              str(p.get("password")) != ""):
-        if t != "ss":  # ss 允许空密码的情况极少，这里统一要求非空
-            return False
+        return False
+    if p.get("dialer-proxy"):
+        return False  # 单节点订阅不能保留依赖原订阅其它代理名称的链式节点
+    p["port"] = port
     if not p.get("name"):
         p["name"] = f"{t}-{host}"
     return True

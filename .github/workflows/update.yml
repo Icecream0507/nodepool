@@ -17,26 +17,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install requests pyyaml
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate logic
+        run: python -m unittest discover -s tests -v
 
       # 跨运行保留节点池/纯净度缓存（尽力而为；丢了也不影响订阅链接）
       - name: Restore pool cache
-        uses: actions/cache@v4
+        id: pool-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: data
-          key: nodepool-data-${{ github.run_id }}
+          key: ${{ runner.os }}-nodepool-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            ${{ runner.os }}-nodepool-v2-
             nodepool-data-
+
+      - name: Restore mihomo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: bin
+          key: ${{ runner.os }}-${{ runner.arch }}-mihomo-${{ hashFiles('nodepool/mihomo.py') }}
 
       - name: Run update (直连，云端无需代理)
         env:
           GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
           NODEPOOL_GIST_ID: ${{ secrets.GIST_ID }}
+          PYTHONUNBUFFERED: "1"
+          PYTHONUTF8: "1"
         run: python update.py --proxy ""
+
+      - name: Save pool even if update failed
+        if: ${{ always() && hashFiles('data/pool.json') != '' && steps.pool-cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: data
+          key: ${{ steps.pool-cache.outputs.cache-primary-key }}

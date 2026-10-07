@@ -1,138 +1,221 @@
-"""节点池：持久化、合并新采集、记录测试结果、淘汰长期失效节点。
-
-pool.json 结构： { node_id: record }
-record = {
-  id, key, proxy{mihomo dict}, source,
-  first_seen, last_seen, last_ok, fail_streak,
-  latency_ms, purity{score,residential,broadcast,asn,org,cc,country,ip,ts}
-}
-"""
+"""持久化节点池：轮转探索、稳定节点晋升、失败冷却和历史迁移。"""
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 
-from .util import log, node_id, node_key
+from .util import atomic_write, log, node_id, node_key
+
+
+def _migrate(data: dict) -> dict[str, dict]:
+    if not isinstance(data, dict):
+        raise ValueError("节点池必须是对象")
+    out = {}
+    for old in data.values():
+        if not isinstance(old, dict) or not isinstance(old.get("proxy"), dict):
+            raise ValueError("节点池记录缺少 proxy")
+        r = dict(old)
+        nid = node_id(r["proxy"])
+        r.update(id=nid, key=node_key(r["proxy"]))
+        r.setdefault("last_test", r.get("last_ok", 0))
+        r.setdefault("test_count", 1 if r.get("last_ok") else 0)
+        r.setdefault("success_count", 1 if r.get("last_ok") else 0)
+        r.setdefault("success_streak", 0)
+        r.setdefault("stable", False)
+        r.setdefault("stable_since", 0)
+        r.setdefault("retired_until", 0)
+        r.setdefault("history", [])
+        previous = out.get(nid)
+        if not previous or r.get("last_test", 0) > previous.get("last_test", 0):
+            out[nid] = r
+    return out
 
 
 def load(path: Path) -> dict[str, dict]:
-    if not path.exists():
+    backup = path.with_suffix(".json.bak")
+    if not path.exists() and not backup.exists():
         return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        log.warning("读取节点池失败（将重建）：%s", e)
-        return {}
+    for candidate in (path, backup):
+        if not candidate.exists():
+            continue
+        try:
+            result = _migrate(json.loads(candidate.read_text(encoding="utf-8")))
+            if candidate == backup:
+                log.warning("节点池主文件损坏，已从备份恢复")
+            return result
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            log.warning("读取节点池 %s 失败：%s", candidate.name, exc)
+    raise RuntimeError("节点池及备份均无法读取，停止更新以保护原有数据")
 
 
 def save(path: Path, pool: dict[str, dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(pool, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    if path.exists():
+        previous = path.read_text(encoding="utf-8")
+        try:
+            _migrate(json.loads(previous))
+        except (ValueError, TypeError, KeyError):
+            pass
+        else:
+            atomic_write(path.with_suffix(".json.bak"), previous)
+    atomic_write(path, json.dumps(pool, ensure_ascii=False, indent=1))
 
 
 def merge_collected(pool: dict[str, dict], nodes: list[dict]) -> int:
     now = int(time.time())
     added = 0
-    for p in nodes:
-        src = p.pop("_source", "")
-        key = node_key(p)
+    for raw in nodes:
+        p = {k: v for k, v in raw.items() if not k.startswith("_")}
+        src = raw.get("_source", "")
         nid = node_id(p)
         if nid in pool:
             pool[nid]["last_seen"] = now
+            pool[nid]["proxy"] = p
             if src:
                 pool[nid]["source"] = src
         else:
             pool[nid] = {
-                "id": nid, "key": key, "proxy": p, "source": src,
+                "id": nid, "key": node_key(p), "proxy": p, "source": src,
                 "first_seen": now, "last_seen": now, "last_ok": 0,
-                "fail_streak": 0, "latency_ms": None, "purity": None,
+                "last_test": 0, "test_count": 0, "success_count": 0,
+                "success_streak": 0, "fail_streak": 0,
+                "stable": False, "stable_since": 0, "retired_until": 0,
+                "history": [], "latency_ms": None, "purity": None,
             }
             added += 1
     return added
 
 
-def purity_from_api(data: dict) -> dict:
-    def _int(v, d=None):
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return d
+def purity_from_api(data: dict) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("fraudScore")
+    try:
+        if isinstance(raw, bool) or raw is None or float(raw) != int(raw):
+            return None
+        score = int(raw)
+        if not 0 <= score <= 100:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        asn = int(data.get("asn"))
+    except (TypeError, ValueError):
+        asn = None
     return {
-        "score": _int(data.get("fraudScore")),
-        "residential": bool(data.get("isResidential")),
-        "broadcast": bool(data.get("isBroadcast")),
-        "asn": _int(data.get("asn")),
-        "org": data.get("asOrganization"),
-        "cc": data.get("countryCode"),
-        "country": data.get("country"),
-        "ip": data.get("ip"),
-        "ts": int(time.time()),
+        "score": score, "residential": data.get("isResidential") is True,
+        "broadcast": data.get("isBroadcast") is True, "asn": asn,
+        "org": data.get("asOrganization"), "cc": data.get("countryCode"),
+        "country": data.get("country"), "ip": data.get("ip"), "ts": int(time.time()),
     }
 
 
-def record_test(pool: dict[str, dict], nid: str, alive: bool, latency_ms: int | None) -> None:
+def record_test(pool: dict[str, dict], nid: str, alive: bool,
+                latency_ms: int | None, history_size: int = 20) -> None:
     rec = pool.get(nid)
     if not rec:
         return
     now = int(time.time())
+    rec["last_test"] = now
+    rec["test_count"] = rec.get("test_count", 0) + 1
+    rec["success_count"] = rec.get("success_count", 0) + int(alive)
+    rec["success_streak"] = rec.get("success_streak", 0) + 1 if alive else 0
     if alive:
-        rec["fail_streak"] = 0
-        rec["last_ok"] = now
-        rec["latency_ms"] = latency_ms
+        rec.update(fail_streak=0, last_ok=now, latency_ms=latency_ms, retired_until=0)
     else:
         rec["fail_streak"] = rec.get("fail_streak", 0) + 1
+    rec["history"] = (rec.get("history", []) + [{"ts": now, "ok": alive}])[-history_size:]
 
 
-def record_purity(pool: dict[str, dict], nid: str, data: dict) -> None:
+def record_purity(pool: dict[str, dict], nid: str, data: dict) -> bool:
     rec = pool.get(nid)
-    if rec:
-        rec["purity"] = purity_from_api(data)
-
-
-def prune(pool: dict[str, dict], max_fail: int) -> int:
-    drop = [nid for nid, r in pool.items() if r.get("fail_streak", 0) >= max_fail]
-    for nid in drop:
-        del pool[nid]
-    return len(drop)
-
-
-def enforce_limits(pool: dict[str, dict], max_size: int, stale_days: float) -> int:
-    """清理从未连通的陈旧节点，并把总量压到上限内（优先淘汰从未连通的旧节点）。"""
-    now = time.time()
-    removed = 0
-    for nid in list(pool):
-        r = pool[nid]
-        if not r.get("last_ok") and (now - r.get("first_seen", now)) > stale_days * 86400:
-            del pool[nid]
-            removed += 1
-    if len(pool) > max_size:
-        never = [r for r in pool.values() if not r.get("last_ok")]
-        never.sort(key=lambda r: r.get("last_seen", 0))
-        for r in never[: len(pool) - max_size]:
-            pool.pop(r["id"], None)
-            removed += 1
-    return removed
-
-
-def select_candidates(pool: dict[str, dict], max_candidates: int) -> list[dict]:
-    """挑选本轮要测试的节点（record 列表），优先保留历史可用节点。"""
-    recs = list(pool.values())
-
-    def rank(r):
-        # 先测最近成功过的，再测新采集的，再测其它
-        if r.get("last_ok"):
-            return (0, -r["last_ok"])
-        return (1, -r.get("first_seen", 0))
-
-    recs.sort(key=rank)
-    return recs[:max_candidates]
+    purity = purity_from_api(data)
+    if rec is None or purity is None:
+        return False
+    rec["purity"] = purity
+    return True
 
 
 def fresh_purity(rec: dict, cache_hours: float) -> bool:
     p = rec.get("purity")
-    if not p or not p.get("ts"):
+    if not isinstance(p, dict) or not p.get("ts"):
         return False
-    return (time.time() - p["ts"]) < cache_hours * 3600
+    score = p.get("score")
+    return (type(score) is int and 0 <= score <= 100
+            and 0 <= time.time() - p["ts"] < cache_hours * 3600)
+
+
+def promote_stable(pool: dict[str, dict], cfg: dict, cache_hours: float,
+                   max_score: int) -> int:
+    promoted = 0
+    for r in pool.values():
+        if r.get("stable") or r.get("success_streak", 0) < cfg["stable_min_passes"]:
+            continue
+        history = r.get("history", [])
+        rate = sum(h["ok"] for h in history) / len(history) if history else 0
+        if rate >= cfg["stable_min_rate"] and fresh_purity(r, cache_hours) and r["purity"]["score"] <= max_score:
+            r.update(stable=True, stable_since=int(time.time()))
+            promoted += 1
+    return promoted
+
+
+def prune(pool: dict[str, dict], max_fail: int, *, stable_max_fail: int = 12,
+          stable_grace_days: float = 7, cooldown_hours: float = 24) -> int:
+    """普通节点连续失败后冷却；稳定节点同时达到失败次数和宽限期才冷却。"""
+    now = time.time()
+    retired = 0
+    for r in pool.values():
+        if r.get("retired_until", 0) > now:
+            continue
+        if r.get("retired_at", 0) >= r.get("last_test", 0):
+            continue
+        limit = stable_max_fail if r.get("stable") else max_fail
+        if r.get("fail_streak", 0) < limit:
+            continue
+        if r.get("stable") and now - r.get("last_ok", now) < stable_grace_days * 86400:
+            continue
+        r["retired_until"] = int(now + cooldown_hours * 3600)
+        r["retired_at"] = int(now)
+        retired += 1
+    return retired
+
+
+def enforce_limits(pool: dict[str, dict], max_size: int, stale_days: float) -> int:
+    if max_size < 1 or stale_days <= 0:
+        raise ValueError("节点池容量和陈旧天数必须为正")
+    now = time.time()
+    drop = [nid for nid, r in pool.items() if not r.get("last_ok")
+            and now - r.get("last_seen", now) > stale_days * 86400]
+    for nid in drop:
+        del pool[nid]
+    overflow = max(0, len(pool) - max_size)
+    ordered = sorted(pool.values(), key=lambda r: (
+        bool(r.get("stable")), bool(r.get("last_ok")),
+        r.get("last_ok", 0), r.get("last_seen", 0)))
+    for r in ordered[:overflow]:
+        del pool[r["id"]]
+    return len(drop) + overflow
+
+
+def select_candidates(pool: dict[str, dict], max_candidates: int,
+                      exploration_ratio: float = 0.25, max_score: int = 40) -> list[dict]:
+    if max_candidates < 1 or not 0 < exploration_ratio < 1:
+        raise ValueError("候选上限必须为正，探索比例必须在 0 和 1 之间")
+    now = time.time()
+    eligible = [r for r in pool.values() if r.get("retired_until", 0) <= now]
+    def proven(r):
+        p = r.get("purity") or {}
+        score = p.get("score")
+        return bool(r.get("last_ok")) and (score is None or (type(score) is int and 0 <= score <= max_score))
+    known = [r for r in eligible if proven(r)]
+    explore = [r for r in eligible if not proven(r)]
+    known.sort(key=lambda r: (r.get("last_test", 0), not r.get("stable", False), r["id"]))
+    explore.sort(key=lambda r: (r.get("last_test", 0), -r.get("first_seen", 0), r["id"]))
+    quota = min(len(explore), max(1, math.ceil(max_candidates * exploration_ratio)))
+    if max_candidates == 1 and known:
+        return sorted(eligible, key=lambda r: (r.get("last_test", 0), r["id"]))[:1]
+    selected = known[:max_candidates - quota] + explore[:quota]
+    seen = {r["id"] for r in selected}
+    rest = [r for r in known + explore if r["id"] not in seen]
+    return selected + rest[:max_candidates - len(selected)]

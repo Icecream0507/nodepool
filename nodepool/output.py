@@ -45,6 +45,7 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     tiers = cfg["purity"]["tiers"]
     g_auto = cfg["output"]["group_auto"]
     g_select = cfg["output"]["group_select"]
+    g_stable = cfg["output"].get("group_stable", "🛡️ 稳定节点")
 
     # 按 (档位, 延迟) 排序
     def sort_key(r):
@@ -53,10 +54,11 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
 
     final = sorted(final, key=sort_key)
 
-    used: set = set()
+    used: set = {g_auto, g_select, g_stable, "DIRECT", "REJECT", "GLOBAL", *[t[2] for t in tiers]}
     proxies = []
     tier_members: dict[str, list[str]] = {label: [] for _, _, label in tiers}
     stats = {label: 0 for _, _, label in tiers}
+    stable_names = []
     for rec in final:
         t = tier_of(rec["purity"]["score"], tiers)
         if not t:
@@ -68,15 +70,22 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
         proxies.append(pd)
         tier_members[label].append(name)
         stats[label] += 1
+        if rec.get("stable"):
+            stable_names.append(name)
 
     all_names = [p["name"] for p in proxies]
     # lazy:false + 较短 interval：客户端持续健康检查，自动绕开刚死掉的节点
-    ut = {"type": "url-test", "url": TEST_URL, "interval": 180, "tolerance": 50, "lazy": False}
+    if not proxies:
+        raise ValueError("没有可输出的节点，拒绝生成空订阅")
+    ut = {"type": "url-test", "url": cfg["connectivity"]["test_url"], "interval": 180, "tolerance": 50, "lazy": False}
     groups = [
         {"name": g_select, "type": "select",
-         "proxies": [g_auto] + [lbl for _, _, lbl in tiers if tier_members[lbl]] + ["DIRECT"]},
-        {"name": g_auto, **ut, "proxies": all_names or ["DIRECT"]},
+         "proxies": ([g_stable] if stable_names else []) + [g_auto]
+                    + [lbl for _, _, lbl in tiers if tier_members[lbl]] + all_names + ["DIRECT"]},
+        {"name": g_auto, **ut, "proxies": all_names},
     ]
+    if stable_names:
+        groups.append({"name": g_stable, **ut, "proxies": stable_names})
     for _, _, lbl in tiers:
         if tier_members[lbl]:
             groups.append({"name": lbl, **ut, "proxies": tier_members[lbl]})

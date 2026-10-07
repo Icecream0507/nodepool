@@ -20,13 +20,16 @@ API_URL = "https://api.github.com/gists/{}"
 GIST_HREF = re.compile(r'href="/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?)/([0-9a-f]{20,})"')
 
 
-def search_gist_ids(cfg, session) -> list[tuple[str, str]]:
+def search_gist_ids(cfg, session, deadline=None) -> list[tuple[str, str]]:
     q = cfg["search"]["query"]
     pages = int(cfg["search"]["pages"])
     delay = float(cfg["search"]["page_delay"])
     found: list[tuple[str, str]] = []
     seen = set()
     for page in range(1, pages + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            log.warning("采集时间预算已到，使用已读取的来源")
+            break
         url = f"{SEARCH_URL}?o=desc&q={quote(q)}&s=updated&p={page}"
         r = get_with_retry(session, url, tries=3, timeout=30)
         if r is None or r.status_code != 200:
@@ -84,13 +87,22 @@ def fetch_gist_nodes(owner: str, gid: str, session, token: str | None) -> list[d
 
 
 def collect(cfg, session, token: str | None) -> list[dict]:
-    ids = search_gist_ids(cfg, session)
+    deadline = time.monotonic() + cfg["search"].get("max_seconds", 420)
+    ids = search_gist_ids(cfg, session, deadline)
     log.info("共发现 %d 个候选 gist，开始读取内容…", len(ids))
     min_n = int(cfg["collect"]["min_nodes_per_gist"])
     uniq: dict[str, dict] = {}
     skipped_small = 0
     for i, (owner, gid) in enumerate(ids, 1):
-        nodes = fetch_gist_nodes(owner, gid, session, token)
+        if time.monotonic() >= deadline:
+            log.warning("采集时间预算已到，保留本轮已采集节点")
+            break
+        try:
+            nodes = fetch_gist_nodes(owner, gid, session, token)
+            nodes = list({node_key(p): p for p in nodes}.values())
+        except (ValueError, TypeError, KeyError, AttributeError):
+            log.warning("来源 %s 内容异常，跳过该 gist", gid[:8])
+            continue
         if len(nodes) < min_n:
             skipped_small += 1
             continue

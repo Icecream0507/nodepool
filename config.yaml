@@ -8,6 +8,7 @@ search:
   query: "vless://"      # gist 全文搜索关键词
   pages: 10              # 翻几页（每页约 10 个 gist）
   page_delay: 2.0        # 翻页间隔秒数，别调太小以免被限流
+  max_seconds: 420       # 采集软时间预算，保留时间给检测与发布
 
 collect:
   min_nodes_per_gist: 3  # 单个 gist 节点数少于此值则跳过（多半是个人自建配置误公开）
@@ -23,10 +24,12 @@ connectivity:
 purity:
   api: "https://my.ippure.com/v1/info"
   max_score: 40          # IPPure 系数上限，超过则丢弃
-  cache_hours: 24        # 同一节点/出口 IP 在此时间内不重复查询
+  cache_hours: 24        # 同一节点的有效评分在此时间内复用
   concurrency: 4         # 同时查询数（对 ippure 温和一点）
   stagger: 0.4           # 每次请求之间最小间隔秒数
   request_timeout: 15
+  batch_size: 16         # 分批创建监听端口
+  max_seconds: 420       # 达到预算后，未测节点留待下轮
   # 分级：[下限, 上限, 名称]，按 ippure 官方刻度
   tiers:
     - [0, 15, "极度纯净"]
@@ -34,9 +37,16 @@ purity:
     - [25, 40, "中性"]
 
 pool:
-  max_fail: 3            # 连续多少次运行都失败就从池中删除
+  max_fail: 3            # 普通节点连续失败后冷却，保留记录供恢复
   max_size: 20000        # 节点池总量上限，超出时优先淘汰从未连通的旧节点
   stale_days: 3          # 从未连通且超过此天数未再出现的节点直接清理
+  stable_min_passes: 5   # 连续成功 5 次且纯净度合格后晋升稳定池
+  stable_min_rate: 0.8   # 最近 history_size 次测试成功率至少 80%
+  history_size: 20
+  stable_max_fail: 12    # 稳定节点失败至少 12 次且超过宽限期才冷却
+  stable_grace_days: 7   # 稳定节点最后成功后 7 天内保留复测资格
+  cooldown_hours: 24     # 冷却后可重新测试，采集不重置历史
+  exploration_ratio: 0.25 # 为未验证/超标节点预留 25% 探索名额
 
 mihomo:
   controller: "127.0.0.1:19090"
@@ -49,8 +59,11 @@ output:
   # 生成订阅里给代理组起的名字
   group_auto: "♻️ 自动选择"
   group_select: "🔰 手动选择"
+  group_stable: "🛡️ 稳定节点"
+  max_test_age_hours: 12 # 未轮到复测的节点，最近测活有效期
 
 publish:
   enabled: true                 # 有 token 就自动发布到 secret gist
   gist_filename: "clash.yaml"
+  pool_filename: "stable-pool.json" # 同一 secret gist 备份稳定节点，缓存丢失时恢复
   gist_description: "nodepool auto-updated clash subscription"

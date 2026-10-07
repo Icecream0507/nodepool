@@ -4,9 +4,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import ipaddress
+import json
 import logging
+import os
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 import requests
 
@@ -49,7 +54,7 @@ def get_with_retry(session: requests.Session, url: str, *, tries: int = 3,
             if r.status_code == 200:
                 return r
             # gist/api 限流会给 403/429
-            if r.status_code in (403, 429) and i < tries - 1:
+            if r.status_code in (403, 429, 500, 502, 503, 504) and i < tries - 1:
                 wait = 5 * (i + 1)
                 log.warning("  %s -> %s，等待 %ss 重试", url[:70], r.status_code, wait)
                 time.sleep(wait)
@@ -103,7 +108,7 @@ def resolve_ipv4(host: str) -> list[str]:
 
 
 def flag_emoji(cc: str | None) -> str:
-    if not cc or len(cc) != 2 or not cc.isalpha():
+    if not isinstance(cc, str) or len(cc) != 2 or not cc.isascii() or not cc.isalpha():
         return "🏳"
     cc = cc.upper()
     return chr(0x1F1E6 + ord(cc[0]) - 65) + chr(0x1F1E6 + ord(cc[1]) - 65)
@@ -126,19 +131,56 @@ def is_bogus_host(host: str) -> bool:
 
 
 def node_key(p: dict) -> str:
-    """节点去重指纹：类型 + 服务器 + 端口 + 凭据 + 传输 + sni + 路径。"""
-    cred = p.get("uuid") or p.get("password") or ""
-    net = p.get("network", "")
-    sni = p.get("servername") or p.get("sni") or ""
-    path = ""
-    if "ws-opts" in p:
-        path = (p["ws-opts"] or {}).get("path", "")
-    elif "grpc-opts" in p:
-        path = (p["grpc-opts"] or {}).get("grpc-service-name", "")
-    parts = [str(p.get("type")), str(p.get("server")).lower(), str(p.get("port")),
-             str(cred), str(net), str(sni), str(path)]
-    return "|".join(parts)
+    """所有连接参数参与去重；展示名称和采集元数据不参与。"""
+    data = {k: v for k, v in p.items() if k != "name" and not k.startswith("_")}
+    data["server"] = str(data.get("server", "")).strip().lower()
+    data["port"] = int(data["port"])
+    if data.get("type") in ("vless", "vmess", "trojan"):
+        data.setdefault("network", "tcp")
+    return json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
 def node_id(p: dict) -> str:
-    return hashlib.sha1(node_key(p).encode("utf-8")).hexdigest()[:10]
+    return hashlib.sha256(node_key(p).encode("utf-8")).hexdigest()[:16]
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+@contextmanager
+def run_lock(path: Path):
+    """进程退出时由操作系统释放锁，防止本机并行更新互相覆盖。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as f:
+        if f.tell() == 0:
+            f.write(b"0")
+            f.flush()
+        f.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError("另一个 nodepool 更新进程正在运行") from exc
+        try:
+            yield
+        finally:
+            f.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
