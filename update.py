@@ -53,6 +53,7 @@ def _run(cfg, args) -> int:
     token = publish.load_token(ROOT)
     log.info("代理=%s token=%s", cfg.get("proxy") or "直连", "有" if token else "无")
     pc = cfg["pool"]
+    test_policy = pool.connectivity_policy(cfg["connectivity"])
     try:
         remote_ready = True
         if token:
@@ -95,7 +96,7 @@ def _run(cfg, args) -> int:
             results = mihomo.test_connectivity(exe, valid, cfg) if valid else {}
             for r in cands:
                 alive, lat = _alive_and_latency(results.get(r["id"], []), cfg["connectivity"]["min_pass"])
-                pool.record_test(pl, r["id"], alive, lat, pc["history_size"])
+                pool.record_test(pl, r["id"], alive, lat, pc["history_size"], policy=test_policy)
                 if alive:
                     alive_ids.add(r["id"])
             log.info("连通性通过：%d / %d", len(alive_ids), len(cands))
@@ -107,13 +108,14 @@ def _run(cfg, args) -> int:
             probes = [{**r["proxy"], "name": r["id"]} for r in need]
             mihomo.probe_purity(exe, probes, cfg,
                                on_result=lambda nid, data: pool.record_purity(pl, nid, data))
-        promoted = pool.promote_stable(pl, pc, cache_h, cfg["purity"]["max_score"])
+        promoted = pool.promote_stable(pl, pc, cache_h, cfg["purity"]["max_score"], policy=test_policy)
         retired = pool.prune(pl, pc["max_fail"], stable_max_fail=pc["stable_max_fail"],
                              stable_grace_days=pc["stable_grace_days"], cooldown_hours=pc["cooldown_hours"])
         log.info("晋升稳定节点 %d 个；进入冷却 %d 个", promoted, retired)
         # 未轮到本次复测的节点，在连通性与纯净度有效期内继续服务。
         now = time.time()
         final = [r for r in pl.values() if r.get("last_ok", 0) > 0
+                 and pool.tested_with_policy(r, test_policy)
                  and r.get("last_test") == r.get("last_ok") and r.get("fail_streak", 0) == 0
                  and 0 <= now - r["last_ok"] < cfg["output"]["max_test_age_hours"] * 3600
                  and pool.fresh_purity(r, cache_h) and r["purity"]["score"] <= cfg["purity"]["max_score"]]

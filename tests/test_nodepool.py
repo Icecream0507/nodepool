@@ -49,7 +49,7 @@ def record(server="8.8.8.8"):
 def qualified(server="8.8.8.8"):
     r = record(server)
     pl = {r["id"]: r}
-    pool.record_test(pl, r["id"], True, 20)
+    pool.record_test(pl, r["id"], True, 20, policy=pool.connectivity_policy(config()["connectivity"]))
     pool.record_purity(pl, r["id"], {"fraudScore": 5, "countryCode": "US", "ip": "8.8.4.4"})
     return r
 

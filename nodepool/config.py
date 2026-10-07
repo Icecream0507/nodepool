@@ -8,6 +8,10 @@ from urllib.parse import urlparse
 
 import yaml
 
+DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
+DEFAULT_VERIFICATION_URL = "https://cp.cloudflare.com/generate_204"
+LEGACY_TEST_URL = "http://www.gstatic.com/generate_204"
+
 DEFAULTS = {
     "pool": {"stable_min_passes": 5, "stable_min_rate": 0.8, "history_size": 20,
              "stable_max_fail": 12, "stable_grace_days": 7, "cooldown_hours": 24,
@@ -31,6 +35,16 @@ def load_config(path: Path) -> dict:
             raise ValueError(f"配置缺少 {section} 对象")
         for key, value in DEFAULTS.get(section, {}).items():
             cfg[section].setdefault(key, copy.deepcopy(value))
+    # Upgrade the old built-in probe, while preserving a user's custom URL and
+    # its previous status-code behavior unless they explicitly opt in.
+    connectivity = cfg["connectivity"]
+    if connectivity.get("test_url") in (LEGACY_TEST_URL, DEFAULT_TEST_URL):
+        connectivity["test_url"] = DEFAULT_TEST_URL
+        connectivity.setdefault("verification_url", DEFAULT_VERIFICATION_URL)
+        connectivity.setdefault("expected_status", 204)
+    else:
+        connectivity.setdefault("verification_url", None)
+        connectivity.setdefault("expected_status", None)
     validate_config(cfg)
     return cfg
 
@@ -65,6 +79,23 @@ def validate_config(cfg: dict) -> None:
         raise ValueError("纯净度监听端口范围超出 65535")
     if cfg["connectivity"]["min_pass"] > cfg["connectivity"]["rounds"]:
         raise ValueError("connectivity.min_pass 不能超过 rounds")
+    number("connectivity", "timeout_ms", 1, 32767, integer=True)
+    cc = cfg["connectivity"]
+    if cc.get("expected_status") is not None:
+        number("connectivity", "expected_status", 100, 599, integer=True)
+    verification = cc.get("verification_url")
+    if verification is not None and not isinstance(verification, str):
+        raise ValueError("connectivity.verification_url 必须是 HTTP(S) URL 或 null")
+    if verification:
+        u = urlparse(verification)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise ValueError("connectivity.verification_url 必须是 HTTP(S) URL")
+        if verification == cc["test_url"]:
+            raise ValueError("连通性两个测试目标必须不同")
+        # Round-robin probes must require a success from both targets. A node
+        # that can reach only one endpoint must never pass a full test.
+        if cc["rounds"] < 2 or cc["min_pass"] <= (cc["rounds"] + 1) // 2:
+            raise ValueError("多目标检测的 min_pass 必须超过单一目标的最大检测轮数")
     if cfg["pool"]["history_size"] < cfg["pool"]["stable_min_passes"]:
         raise ValueError("history_size 不能小于 stable_min_passes")
     if cfg["pool"]["stable_max_fail"] < cfg["pool"]["max_fail"]:

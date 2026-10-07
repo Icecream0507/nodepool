@@ -2,11 +2,25 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import time
 from pathlib import Path
 
 from .util import atomic_write, log, node_id, node_key
+
+
+def connectivity_policy(cfg: dict) -> str:
+    """Identify the evidence required for publication without deleting old tests."""
+    policy = {"schema": 2, **{key: cfg.get(key) for key in (
+        "test_url", "verification_url", "timeout_ms", "rounds", "min_pass")},
+        "expected_status": cfg.get("expected_status", 204)}
+    encoded = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def tested_with_policy(rec: dict, policy: str) -> bool:
+    return rec.get("last_test_policy") == policy
 
 
 def _migrate(data: dict) -> dict[str, dict]:
@@ -28,8 +42,18 @@ def _migrate(data: dict) -> dict[str, dict]:
         r.setdefault("retired_until", 0)
         r.setdefault("history", [])
         previous = out.get(nid)
-        if not previous or r.get("last_test", 0) > previous.get("last_test", 0):
+        if not previous:
             out[nid] = r
+            continue
+        latest, older = (r, previous) if r.get("last_test", 0) > previous.get("last_test", 0) else (previous, r)
+        # Renamed legacy records can share one connection fingerprint. Keep
+        # the newest health state while preserving the earned stable identity.
+        if older.get("stable"):
+            latest["stable"] = True
+        since = [v for v in (latest.get("stable_since", 0), older.get("stable_since", 0)) if v > 0]
+        if since:
+            latest["stable_since"] = min(since)
+        out[nid] = latest
     return out
 
 
@@ -112,12 +136,14 @@ def purity_from_api(data: dict) -> dict | None:
 
 
 def record_test(pool: dict[str, dict], nid: str, alive: bool,
-                latency_ms: int | None, history_size: int = 20) -> None:
+                latency_ms: int | None, history_size: int = 20, *,
+                policy: str | None = None) -> None:
     rec = pool.get(nid)
     if not rec:
         return
     now = int(time.time())
     rec["last_test"] = now
+    rec["last_test_policy"] = policy
     rec["test_count"] = rec.get("test_count", 0) + 1
     rec["success_count"] = rec.get("success_count", 0) + int(alive)
     rec["success_streak"] = rec.get("success_streak", 0) + 1 if alive else 0
@@ -125,7 +151,10 @@ def record_test(pool: dict[str, dict], nid: str, alive: bool,
         rec.update(fail_streak=0, last_ok=now, latency_ms=latency_ms, retired_until=0)
     else:
         rec["fail_streak"] = rec.get("fail_streak", 0) + 1
-    rec["history"] = (rec.get("history", []) + [{"ts": now, "ok": alive}])[-history_size:]
+    entry = {"ts": now, "ok": alive}
+    if policy is not None:
+        entry["policy"] = policy
+    rec["history"] = (rec.get("history", []) + [entry])[-history_size:]
 
 
 def record_purity(pool: dict[str, dict], nid: str, data: dict) -> bool:
@@ -147,12 +176,26 @@ def fresh_purity(rec: dict, cache_hours: float) -> bool:
 
 
 def promote_stable(pool: dict[str, dict], cfg: dict, cache_hours: float,
-                   max_score: int) -> int:
+                   max_score: int, *, policy: str | None = None) -> int:
     promoted = 0
     for r in pool.values():
-        if r.get("stable") or r.get("success_streak", 0) < cfg["stable_min_passes"]:
+        if r.get("stable"):
             continue
         history = r.get("history", [])
+        streak = r.get("success_streak", 0)
+        if policy is not None:
+            if not tested_with_policy(r, policy):
+                continue
+            # A new policy starts its own qualification streak. Earlier
+            # evidence stays in history, but cannot satisfy stricter tests.
+            streak = 0
+            for item in reversed(history):
+                if item.get("policy") != policy or not item.get("ok"):
+                    break
+                streak += 1
+            history = [item for item in history if item.get("policy") == policy]
+        if streak < cfg["stable_min_passes"]:
+            continue
         rate = sum(h["ok"] for h in history) / len(history) if history else 0
         if rate >= cfg["stable_min_rate"] and fresh_purity(r, cache_hours) and r["purity"]["score"] <= max_score:
             r.update(stable=True, stable_since=int(time.time()))

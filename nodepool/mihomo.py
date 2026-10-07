@@ -182,14 +182,40 @@ class Mihomo:
         self._temp.cleanup()
 
     # ---- API ----
-    def delay(self, name: str, url: str, timeout_ms: int) -> int | None:
+    def delay(self, name: str, url: str, timeout_ms: int,
+              expected_status: int | None = None) -> int | None:
         from urllib.parse import quote
+        proxy_url = f"{self.base}/proxies/{quote(name, safe='')}"
+        params = {"timeout": timeout_ms, "url": url}
+        if expected_status is not None:
+            params["expected"] = str(expected_status)
         try:
-            r = self.sess.get(f"{self.base}/proxies/{quote(name, safe='')}/delay",
-                              params={"timeout": timeout_ms, "url": url},
+            r = self.sess.get(proxy_url + "/delay",
+                              params=params,
                               timeout=timeout_ms / 1000 + 3)
             if r.status_code == 200:
-                return int(r.json().get("delay"))
+                result = r.json()
+                delay = result.get("delay") if isinstance(result, dict) else None
+                if type(delay) is int and delay > 0:
+                    if expected_status is not None:
+                        # Some mihomo versions return a positive delay even
+                        # when the HTTP status mismatches `expected`; they only
+                        # mark the URL-specific state as dead. Read that state
+                        # to avoid accepting captive portals or error pages.
+                        state_response = self.sess.get(proxy_url, timeout=3)
+                        if state_response.status_code != 200:
+                            return None
+                        detail = state_response.json()
+                        extra = detail.get("extra") if isinstance(detail, dict) else None
+                        state = extra.get(url) if isinstance(extra, dict) else None
+                        history = state.get("history") if isinstance(state, dict) else None
+                        if (not isinstance(state, dict) or state.get("alive") is not True
+                                or not isinstance(history, list) or not history
+                                or not isinstance(history[-1], dict)
+                                or type(history[-1].get("delay")) is not int
+                                or history[-1]["delay"] <= 0):
+                            return None
+                    return delay
         except (requests.RequestException, ValueError, TypeError):
             pass
         return None
@@ -305,9 +331,11 @@ def build_purity_config(proxies: list[dict], controller: str, secret: str,
 # ---------------------------------------------------------------- 测延迟
 
 def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, list[int | None]]:
-    """多轮测延迟，返回 {name: [r1, r2, r3]}（None 表示该轮失败）。"""
+    """轮换多个目标检测 HTTPS/返回码，None 表示该轮失败。"""
     cc = cfg["connectivity"]
-    url = cc["test_url"]
+    urls = [cc["test_url"]]
+    if cc.get("verification_url"):
+        urls.append(cc["verification_url"])
     tmo = int(cc["timeout_ms"])
     rounds = int(cc["rounds"])
     conc = int(cc["concurrency"])
@@ -318,9 +346,11 @@ def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, li
         return results
     with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])) as m:
         for rnd in range(1, rounds + 1):
+            url = urls[(rnd - 1) % len(urls)]
             ok = 0
             with cf.ThreadPoolExecutor(max_workers=conc) as ex:
-                futs = {ex.submit(m.delay, p["name"], url, tmo): p["name"] for p in proxies}
+                futs = {ex.submit(m.delay, p["name"], url, tmo, cc.get("expected_status")): p["name"]
+                        for p in proxies}
                 for fut in cf.as_completed(futs):
                     name = futs[fut]
                     d = fut.result()

@@ -7,7 +7,40 @@ import yaml
 
 from .util import flag_emoji
 
-TEST_URL = "http://www.gstatic.com/generate_204"
+TEST_URL = "https://www.gstatic.com/generate_204"
+
+# Keep frequently blocked services ahead of GEOIP: a poisoned CN answer must
+# never turn these domains into direct traffic. No extra GeoSite download needed.
+PROXY_DOMAINS = (
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "google.com", "google.cn", "google.com.hk", "googleapis.com", "gstatic.com",
+    "googleusercontent.com", "googlevideo.com", "youtube.com", "youtu.be", "ytimg.com",
+    "github.com", "githubusercontent.com", "githubassets.com", "github.io", "githubcopilot.com",
+)
+
+
+def build_dns_config(group_auto: str) -> dict:
+    """Separate node bootstrap DNS from destination DNS to avoid a proxy loop."""
+    domestic = ["https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query"]
+    return {
+        "enable": True,
+        "enhanced-mode": "fake-ip",
+        "ipv6": False,
+        "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+        "proxy-server-nameserver": list(domestic),
+        "direct-nameserver": list(domestic),
+        "nameserver": [
+            f"https://1.1.1.1/dns-query#{group_auto}",
+            f"https://8.8.8.8/dns-query#{group_auto}",
+        ],
+        "nameserver-policy": {"+.cn": list(domestic)},
+        # Explicitly avoid GeoIP DNS filtering, including in offline validation.
+        "fallback-filter": {"geoip": False},
+    }
+
+
+def proxy_domain_rules(group_select: str) -> list[str]:
+    return [f"DOMAIN-SUFFIX,{domain},{group_select}" for domain in PROXY_DOMAINS]
 
 
 def tier_of(score: int, tiers: list) -> tuple[int, str] | None:
@@ -77,7 +110,10 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     # lazy:false + 较短 interval：客户端持续健康检查，自动绕开刚死掉的节点
     if not proxies:
         raise ValueError("没有可输出的节点，拒绝生成空订阅")
-    ut = {"type": "url-test", "url": cfg["connectivity"]["test_url"], "interval": 180, "tolerance": 50, "lazy": False}
+    ut = {"type": "url-test", "url": cfg["connectivity"]["test_url"],
+          "interval": 180, "tolerance": 50, "lazy": False}
+    if cfg["connectivity"].get("expected_status") is not None:
+        ut["expected-status"] = cfg["connectivity"]["expected_status"]
     groups = [
         {"name": g_select, "type": "select",
          "proxies": ([g_stable] if stable_names else []) + [g_auto]
@@ -95,15 +131,12 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
         "allow-lan": False,
         "mode": "rule",
         "log-level": "info",
-        "dns": {
-            "enable": True,
-            "enhanced-mode": "fake-ip",
-            "nameserver": ["223.5.5.5", "119.29.29.29", "https://doh.pub/dns-query"],
-            "fallback": ["https://1.1.1.1/dns-query", "https://dns.google/dns-query"],
-        },
+        "dns": build_dns_config(g_auto),
         "proxies": proxies,
         "proxy-groups": groups,
         "rules": [
+            *proxy_domain_rules(g_select),
+            "DOMAIN-SUFFIX,cn,DIRECT",
             "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
             "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
             "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
