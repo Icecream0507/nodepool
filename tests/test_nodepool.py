@@ -258,8 +258,9 @@ class OutputAndConfigTests(unittest.TestCase):
         doc = yaml.safe_load(text)
         self.assertEqual(stats["total"], 3)
         self.assertEqual(doc["proxies"][0]["server"], "1.1.1.1")
-        others = next(g for g in doc["proxy-groups"] if g["name"] == cfg["output"]["group_other"])
-        self.assertEqual(len(others["proxies"]), 2)
+        self.assertEqual(stats["tiers"][cfg["output"]["group_other"]], 2)
+        self.assertEqual(len(doc["proxy-groups"]), 1)
+        self.assertEqual(len(doc["proxy-groups"][0]["proxies"]), 3)
         self.assertIn("未评分", text)
         self.assertNotIn("仅收录系数", text)
         mihomo.validate_subscription(EXE, text) if EXE.exists() else None
@@ -282,11 +283,12 @@ class OutputAndConfigTests(unittest.TestCase):
     def test_empty_subscription_is_rejected(self):
         with self.assertRaises(ValueError): output.build_subscription([], config())
 
-    def test_stable_group_and_manual_individual_selection(self):
+    def test_stable_nodes_share_the_single_auto_group(self):
         r = qualified(); r["stable"] = True
         text, stats = output.build_subscription([r], config())
         doc = yaml.safe_load(text)
-        self.assertIn(config()["output"]["group_stable"], [g["name"] for g in doc["proxy-groups"]])
+        self.assertEqual([g["name"] for g in doc["proxy-groups"]], [config()["output"]["group_auto"]])
+        self.assertEqual(doc["proxy-groups"][0]["type"], "url-test")
         self.assertIn(doc["proxies"][0]["name"], doc["proxy-groups"][0]["proxies"])
         self.assertEqual(stats["total"], 1)
 

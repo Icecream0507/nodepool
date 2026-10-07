@@ -73,7 +73,43 @@ class OutputDnsTests(unittest.TestCase):
             "github.com", "api.github.com", "raw.githubusercontent.com", "github.githubassets.com",
         ):
             with self.subTest(domain=domain):
-                self.assertEqual(route_for_cn_answer(doc["rules"], domain), cfg["output"]["group_select"])
+                self.assertEqual(route_for_cn_answer(doc["rules"], domain), cfg["output"]["group_auto"])
+
+    def test_single_auto_group_has_direct_node_members_and_is_the_rule_default(self):
+        doc, _, cfg = subscription()
+        self.assertEqual(doc["mode"], "rule")
+        self.assertEqual(len(doc["proxy-groups"]), 1)
+        group = doc["proxy-groups"][0]
+        self.assertEqual(group["name"], cfg["output"]["group_auto"])
+        self.assertEqual(group["type"], "url-test")
+        self.assertEqual(group["proxies"], [p["name"] for p in doc["proxies"]])
+        self.assertNotIn(group["name"], group["proxies"])
+        self.assertNotIn("DIRECT", group["proxies"])
+        self.assertFalse(group["lazy"])
+        self.assertEqual(doc["rules"][-1], "MATCH," + group["name"])
+        self.assertEqual(route_for_cn_answer(doc["rules"], "example.org"), "DIRECT")
+
+    def test_legacy_groups_migrate_without_changing_nodes_or_ports(self):
+        doc, _, cfg = subscription()
+        original_nodes = list(doc["proxies"])
+        doc["mixed-port"] = 12345
+        doc["proxy-groups"].insert(0, {"name": "legacy-manual", "type": "select",
+                                      "proxies": [cfg["output"]["group_auto"], "DIRECT"]})
+        doc["rules"][-1] = "MATCH,legacy-manual"
+        doc["dns"]["nameserver"] = ["https://1.1.1.1/dns-query#legacy-manual"]
+        migrated = yaml.safe_load(output.simplify_subscription(yaml.safe_dump(doc), cfg))
+        self.assertEqual(migrated["proxies"], original_nodes)
+        self.assertEqual(migrated["mixed-port"], 12345)
+        self.assertEqual(len(migrated["proxy-groups"]), 1)
+        self.assertEqual(migrated["rules"][-1], "MATCH," + cfg["output"]["group_auto"])
+        self.assertNotIn("legacy-manual", yaml.safe_dump(migrated))
+
+    def test_simplification_rejects_empty_or_ambiguous_node_names(self):
+        doc, _, cfg = subscription()
+        for proxies in ([], [{"name": cfg["output"]["group_auto"]}],
+                        [doc["proxies"][0], doc["proxies"][0]]):
+            with self.subTest(proxies=proxies), self.assertRaises(ValueError):
+                output.simplify_subscription(yaml.safe_dump({"proxies": proxies}), cfg)
 
     def test_dns_avoids_geo_database_and_blocked_direct_fallback(self):
         dns = subscription()[0]["dns"]

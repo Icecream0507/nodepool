@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from nodepool import client_health, mihomo, pool, publish
+from nodepool import client_health, mihomo, output, pool, publish
 from nodepool.config import load_config
 from nodepool.util import atomic_write, log, make_session, run_lock
 
@@ -24,6 +24,7 @@ def _complete_pass(delays, expected: int) -> bool:
 
 
 def verify_document(text: str, exe: Path, cfg: dict) -> tuple[str | None, dict]:
+    text = output.simplify_subscription(text, cfg)
     document = yaml.safe_load(text)
     if not isinstance(document, dict) or not isinstance(document.get("proxies"), list) or not document["proxies"]:
         raise ValueError("候选文件缺少节点")

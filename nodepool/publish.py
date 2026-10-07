@@ -167,6 +167,8 @@ def publish_candidates(root: Path, session, token: str, content: str, cfg: dict)
     document = yaml.safe_load(content)
     if not isinstance(document, dict) or not document.get("proxies"):
         raise ValueError("拒绝发布空候选")
+    from .output import simplify_subscription
+    content = simplify_subscription(content, cfg)
     gid = _fixed_id(root)
     if not gid:
         return False
@@ -187,6 +189,8 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
     document = yaml.safe_load(content)
     if not isinstance(document, dict) or not document.get("proxies"):
         raise ValueError("拒绝发布空订阅")
+    from .output import simplify_subscription
+    content = simplify_subscription(content, cfg)
     fn = cfg["publish"]["gist_filename"]
     state_path = root / "data" / "gist.json"
     state = {}
@@ -205,6 +209,7 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
         candidate_doc = yaml.safe_load(candidates)
         if not isinstance(candidate_doc, dict) or not candidate_doc.get("proxies"):
             raise ValueError("拒绝发布空候选")
+        candidates = simplify_subscription(candidates, cfg)
         payload["files"][cfg["publish"]["candidate_filename"]] = {"content": candidates}
     if records is not None:
         payload["files"].update(_stable_file(records, cfg))

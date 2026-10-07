@@ -1,6 +1,7 @@
 """生成 Clash / mihomo 订阅 yaml。"""
 from __future__ import annotations
 
+import copy
 import time
 
 import yaml
@@ -39,8 +40,52 @@ def build_dns_config(group_auto: str) -> dict:
     }
 
 
-def proxy_domain_rules(group_select: str) -> list[str]:
-    return [f"DOMAIN-SUFFIX,{domain},{group_select}" for domain in PROXY_DOMAINS]
+def proxy_domain_rules(group_auto: str) -> list[str]:
+    return [f"DOMAIN-SUFFIX,{domain},{group_auto}" for domain in PROXY_DOMAINS]
+
+
+def _auto_layout(document: dict, cfg: dict) -> dict:
+    """Route proxy traffic straight to one automatic group with direct node members."""
+    document = copy.deepcopy(document)
+    proxies = document.get("proxies")
+    if not isinstance(proxies, list) or not proxies:
+        raise ValueError("没有可输出的节点，拒绝生成空订阅")
+    group_auto = cfg["output"]["group_auto"]
+    names = []
+    for proxy in proxies:
+        if (not isinstance(proxy, dict) or not isinstance(proxy.get("name"), str)
+                or not proxy["name"] or proxy["name"] in (group_auto, "DIRECT", "REJECT", "GLOBAL")):
+            raise ValueError("节点名称无效或与自动组冲突")
+        names.append(proxy["name"])
+    if len(set(names)) != len(names):
+        raise ValueError("节点名称重复")
+    group = {"name": group_auto, "type": "url-test", "proxies": names,
+             "url": cfg["connectivity"]["test_url"], "interval": 180,
+             "tolerance": 50, "lazy": False}
+    if cfg["connectivity"].get("expected_status") is not None:
+        group["expected-status"] = cfg["connectivity"]["expected_status"]
+    document["mode"] = "rule"
+    document["proxy-groups"] = [group]
+    document["dns"] = build_dns_config(group_auto)
+    document["rules"] = [
+        *proxy_domain_rules(group_auto),
+        "DOMAIN-SUFFIX,cn,DIRECT",
+        "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+        "GEOIP,CN,DIRECT",
+        f"MATCH,{group_auto}",
+    ]
+    return document
+
+
+def simplify_subscription(text: str, cfg: dict) -> str:
+    """Migrate a generated subscription without changing node settings or identities."""
+    document = yaml.safe_load(text)
+    if not isinstance(document, dict):
+        raise ValueError("订阅必须是 YAML 对象")
+    return yaml.safe_dump(_auto_layout(document, cfg), allow_unicode=True, sort_keys=False)
 
 
 def tier_of(score: int | None, tiers: list) -> tuple[int, str] | None:
@@ -78,9 +123,6 @@ def _pretty_name(rec: dict, label: str, used: set) -> str:
 def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     """final：通过筛选的 record 列表。返回 (yaml 文本, 统计)。"""
     tiers = cfg["purity"]["tiers"]
-    g_auto = cfg["output"]["group_auto"]
-    g_select = cfg["output"]["group_select"]
-    g_stable = cfg["output"].get("group_stable", "🛡️ 稳定节点")
     g_other = cfg["output"].get("group_other", "其他节点")
 
     # Stability and measured latency take priority over reference IP scores.
@@ -92,11 +134,9 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     final = sorted(final, key=sort_key)
 
     labels = [t[2] for t in tiers] + [g_other]
-    used: set = {g_auto, g_select, g_stable, "DIRECT", "REJECT", "GLOBAL", *labels}
+    used: set = {g_auto, "DIRECT", "REJECT", "GLOBAL"}
     proxies = []
-    tier_members: dict[str, list[str]] = {label: [] for label in labels}
     stats = {label: 0 for label in labels}
-    stable_names = []
     for rec in final:
         purity = rec.get("purity") if isinstance(rec.get("purity"), dict) else {}
         t = tier_of(purity.get("score"), tiers)
@@ -107,50 +147,15 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
         pd = dict(rec["proxy"])
         pd["name"] = name
         proxies.append(pd)
-        tier_members[label].append(name)
         stats[label] += 1
-        if rec.get("stable"):
-            stable_names.append(name)
 
-    all_names = [p["name"] for p in proxies]
-    # lazy:false + 较短 interval：客户端持续健康检查，自动绕开刚死掉的节点
-    if not proxies:
-        raise ValueError("没有可输出的节点，拒绝生成空订阅")
-    ut = {"type": "url-test", "url": cfg["connectivity"]["test_url"],
-          "interval": 180, "tolerance": 50, "lazy": False}
-    if cfg["connectivity"].get("expected_status") is not None:
-        ut["expected-status"] = cfg["connectivity"]["expected_status"]
-    groups = [
-        {"name": g_select, "type": "select",
-         "proxies": ([g_stable] if stable_names else []) + [g_auto]
-                    + [lbl for lbl in labels if tier_members[lbl]] + all_names + ["DIRECT"]},
-        {"name": g_auto, **ut, "proxies": all_names},
-    ]
-    if stable_names:
-        groups.append({"name": g_stable, **ut, "proxies": stable_names})
-    for lbl in labels:
-        if tier_members[lbl]:
-            groups.append({"name": lbl, **ut, "proxies": tier_members[lbl]})
-
-    config = {
+    config = _auto_layout({
         "mixed-port": 7890,
         "allow-lan": False,
         "mode": "rule",
         "log-level": "info",
-        "dns": build_dns_config(g_auto),
         "proxies": proxies,
-        "proxy-groups": groups,
-        "rules": [
-            *proxy_domain_rules(g_select),
-            "DOMAIN-SUFFIX,cn,DIRECT",
-            "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
-            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-            "GEOIP,CN,DIRECT",
-            f"MATCH,{g_select}",
-        ],
-    }
+    }, cfg)
     body = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     dist = " / ".join(f"{lbl}:{stats[lbl]}" for lbl in labels if stats[lbl])
