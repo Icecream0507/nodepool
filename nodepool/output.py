@@ -123,6 +123,7 @@ def _pretty_name(rec: dict, label: str, used: set) -> str:
 def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     """final：通过筛选的 record 列表。返回 (yaml 文本, 统计)。"""
     tiers = cfg["purity"]["tiers"]
+    g_auto = cfg["output"]["group_auto"]
     g_other = cfg["output"].get("group_other", "其他节点")
 
     # Stability and measured latency take priority over reference IP scores.
