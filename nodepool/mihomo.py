@@ -129,6 +129,10 @@ class Mihomo:
             from urllib.parse import urlparse
             address = urlparse(self.base)
             with socket.socket(socket.AF_INET6 if ":" in address.hostname else socket.AF_INET) as check:
+                if os.name != "nt":
+                    # Match Go's Unix listener behavior: TIME_WAIT from the last
+                    # batch is reusable, while an active listener still fails.
+                    check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 check.bind((address.hostname, address.port))
             self._log = open(os.path.join(self._dir, "mihomo.log"), "w+b")
             self._proc = subprocess.Popen(

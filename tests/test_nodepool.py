@@ -450,6 +450,46 @@ class PurityProbeTests(unittest.TestCase):
         self.assertEqual([len(call.args[1]) for call in probe.call_args_list], [2, 2, 1])
 
 
+class ControllerPortTests(unittest.TestCase):
+    def engine(self, address):
+        controller = f"{address[0]}:{address[1]}"
+        return mihomo.Mihomo(Path("unused"), mihomo.build_test_config([], controller, "test"),
+                             controller, "test", 2)
+
+    @unittest.skipIf(os.name == "nt", "Unix TIME_WAIT port reuse")
+    def test_recently_closed_controller_can_restart(self):
+        # Reproduce a server-initiated close so the controller port, rather
+        # than the client's ephemeral port, remains in TIME_WAIT.
+        with socket.socket() as listener, socket.socket() as client:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0)); listener.listen()
+            address = listener.getsockname()
+            client.settimeout(2)
+            client.connect(address)
+            connection, _ = listener.accept()
+            connection.close()
+            self.assertEqual(client.recv(1), b"")
+        with socket.socket() as check:
+            with self.assertRaises(OSError): check.bind(address)
+        m = self.engine(address)
+        proc = Mock(); proc.poll.return_value = None
+        with patch.object(mihomo.subprocess, "Popen", return_value=proc), patch.object(m.sess, "get", return_value=SimpleNamespace(status_code=200, json=lambda: {"version": "test"})):
+            with m: pass
+        self.assertFalse(Path(m._dir).exists())
+
+    def test_active_controller_is_rejected_even_if_reusable(self):
+        with socket.socket() as listener:
+            if os.name != "nt":
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0)); listener.listen()
+            m = self.engine(listener.getsockname())
+            with patch.object(mihomo.subprocess, "Popen") as start:
+                with self.assertRaises(OSError):
+                    with m: pass
+                start.assert_not_called()
+            self.assertFalse(Path(m._dir).exists())
+
+
 EXE = ROOT / "bin" / ("mihomo.exe" if os.name == "nt" else "mihomo")
 
 
@@ -473,10 +513,11 @@ class NativeMihomoTests(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
         controller = f"127.0.0.1:{port}"
-        m = mihomo.Mihomo(EXE, mihomo.build_test_config([], controller, "test"), controller, "test", 10)
-        directory = Path(m._dir)
-        with m: self.assertTrue(directory.exists())
-        self.assertFalse(directory.exists())
+        for _ in range(3):
+            m = mihomo.Mihomo(EXE, mihomo.build_test_config([], controller, "test"), controller, "test", 10)
+            directory = Path(m._dir)
+            with m: self.assertTrue(directory.exists())
+            self.assertFalse(directory.exists())
 
     def test_occupied_controller_is_not_reused(self):
         with socket.socket() as sock:
