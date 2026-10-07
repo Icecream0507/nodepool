@@ -16,8 +16,8 @@ DEFAULTS = {
     "pool": {"stable_min_passes": 5, "stable_min_rate": 0.8, "history_size": 20,
              "stable_max_fail": 12, "stable_grace_days": 7, "cooldown_hours": 24,
              "exploration_ratio": 0.25},
-    "output": {"group_stable": "🛡️ 稳定节点", "max_test_age_hours": 12},
-    "purity": {"batch_size": 16, "max_seconds": 420},
+    "output": {"group_stable": "🛡️ 稳定节点", "max_test_age_hours": 12, "group_other": "其他节点"},
+    "purity": {"batch_size": 16, "max_seconds": 420, "enabled": True, "required": True},
     "search": {"max_seconds": 420},
     "publish": {"pool_filename": "stable-pool.json", "candidate_filename": "candidates.yaml",
                 "client_health_filename": "client-health.json", "client_health_max_age_hours": 168},
@@ -71,6 +71,11 @@ def validate_config(cfg: dict) -> None:
                          ("output", "max_test_age_hours"), ("search", "max_seconds"), ("purity", "max_seconds")):
         number(section, key, 0.001)
     number("purity", "max_score", 0, 100, integer=True)
+    for key in ("enabled", "required"):
+        if type(cfg["purity"].get(key)) is not bool:
+            raise ValueError(f"purity.{key} 必须为布尔值")
+    if cfg["purity"]["required"] and not cfg["purity"]["enabled"]:
+        raise ValueError("启用评分筛选时必须开启 purity.enabled")
     number("purity", "stagger", 0)
     number("search", "page_delay", 0)
     number("publish", "client_health_max_age_hours", 0.001)
@@ -124,7 +129,9 @@ def validate_config(cfg: dict) -> None:
     if not isinstance(tiers, list) or not tiers:
         raise ValueError("purity.tiers 不能为空")
     previous = 0
-    labels = [cfg["output"][k] for k in ("group_auto", "group_select", "group_stable")]
+    labels = [cfg["output"][k] for k in ("group_auto", "group_select", "group_stable", "group_other")]
+    if any(not isinstance(name, str) or not name.strip() for name in labels):
+        raise ValueError("代理组名称不能为空")
     for tier in tiers:
         if not isinstance(tier, list) or len(tier) != 3:
             raise ValueError("每个纯净度档位必须为 [下限, 上限, 名称]")
@@ -137,7 +144,7 @@ def validate_config(cfg: dict) -> None:
         previous = hi
     if len(set(labels)) != len(labels) or any(n in ("DIRECT", "REJECT", "GLOBAL") for n in labels):
         raise ValueError("代理组名称重复或使用保留名称")
-    if previous < cfg["purity"]["max_score"]:
+    if cfg["purity"]["required"] and previous < cfg["purity"]["max_score"]:
         raise ValueError("purity.tiers 必须覆盖 max_score")
     controller = urlparse("http://" + str(cfg["mihomo"].get("controller", "")))
     if controller.hostname not in ("127.0.0.1", "localhost", "::1") or not controller.port:

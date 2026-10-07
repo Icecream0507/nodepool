@@ -24,8 +24,10 @@ connectivity:
   concurrency: 32
 
 purity:
+  enabled: false        # 默认不查询 IPPure；已有评分仅展示参考
+  required: false       # 不以评分限制输出或稳定池晋升；高分/缺失/过期均可用
   api: "https://my.ippure.com/v1/info"
-  max_score: 40          # IPPure 系数上限，超过则丢弃
+  max_score: 40          # 仅 required:true 时作为评分上限
   cache_hours: 24        # 同一节点的有效评分在此时间内复用
   concurrency: 4         # 同时查询数（对 ippure 温和一点）
   stagger: 0.4           # 每次请求之间最小间隔秒数
@@ -42,13 +44,13 @@ pool:
   max_fail: 3            # 普通节点连续失败后冷却，保留记录供恢复
   max_size: 20000        # 节点池总量上限，超出时优先淘汰从未连通的旧节点
   stale_days: 3          # 从未连通且超过此天数未再出现的节点直接清理
-  stable_min_passes: 5   # 连续成功 5 次且纯净度合格后晋升稳定池
+  stable_min_passes: 5   # 连续测活成功 5 次后晋升稳定池；评分不影响默认策略
   stable_min_rate: 0.8   # 最近 history_size 次测试成功率至少 80%
   history_size: 20
   stable_max_fail: 12    # 稳定节点失败至少 12 次且超过宽限期才冷却
   stable_grace_days: 7   # 稳定节点最后成功后 7 天内保留复测资格
   cooldown_hours: 24     # 冷却后可重新测试，采集不重置历史
-  exploration_ratio: 0.25 # 为未验证/超标节点预留 25% 探索名额
+  exploration_ratio: 0.25 # 为未验证节点预留 25% 探索名额
 
 mihomo:
   controller: "127.0.0.1:19090"

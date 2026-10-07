@@ -176,7 +176,7 @@ def fresh_purity(rec: dict, cache_hours: float) -> bool:
 
 
 def promote_stable(pool: dict[str, dict], cfg: dict, cache_hours: float,
-                   max_score: int, *, policy: str | None = None) -> int:
+                   max_score: int | None, *, policy: str | None = None) -> int:
     promoted = 0
     for r in pool.values():
         if r.get("stable"):
@@ -197,7 +197,9 @@ def promote_stable(pool: dict[str, dict], cfg: dict, cache_hours: float,
         if streak < cfg["stable_min_passes"]:
             continue
         rate = sum(h["ok"] for h in history) / len(history) if history else 0
-        if rate >= cfg["stable_min_rate"] and fresh_purity(r, cache_hours) and r["purity"]["score"] <= max_score:
+        score_ok = (max_score is None or
+                    (fresh_purity(r, cache_hours) and r["purity"]["score"] <= max_score))
+        if rate >= cfg["stable_min_rate"] and score_ok:
             r.update(stable=True, stable_since=int(time.time()))
             promoted += 1
     return promoted
@@ -242,13 +244,15 @@ def enforce_limits(pool: dict[str, dict], max_size: int, stale_days: float) -> i
 
 
 def select_candidates(pool: dict[str, dict], max_candidates: int,
-                      exploration_ratio: float = 0.25, max_score: int = 40, *,
+                      exploration_ratio: float = 0.25, max_score: int | None = 40, *,
                       preferred_ids: set[str] | None = None) -> list[dict]:
     if max_candidates < 1 or not 0 < exploration_ratio < 1:
         raise ValueError("候选上限必须为正，探索比例必须在 0 和 1 之间")
     now = time.time()
     eligible = [r for r in pool.values() if r.get("retired_until", 0) <= now]
     def proven(r):
+        if max_score is None:
+            return bool(r.get("last_ok"))
         p = r.get("purity") or {}
         score = p.get("score")
         return bool(r.get("last_ok")) and (score is None or (type(score) is int and 0 <= score <= max_score))

@@ -53,6 +53,7 @@ def _run(cfg, args) -> int:
     token = publish.load_token(ROOT)
     log.info("代理=%s token=%s", cfg.get("proxy") or "直连", "有" if token else "无")
     pc = cfg["pool"]
+    score_limit = cfg["purity"]["max_score"] if cfg["purity"]["required"] else None
     test_policy = pool.connectivity_policy(cfg["connectivity"])
     try:
         report_path = ROOT / "data" / "client-health.json"
@@ -98,7 +99,7 @@ def _run(cfg, args) -> int:
         preferred_ids = {r["id"] for r in preferred} if report and report["required"] else set()
         selection_args = {"preferred_ids": preferred_ids} if preferred_ids else {}
         cands = pool.select_candidates(pl, cfg["collect"]["max_candidates"],
-                                       pc["exploration_ratio"], cfg["purity"]["max_score"], **selection_args)
+                                       pc["exploration_ratio"], score_limit, **selection_args)
         alive_ids = set()
         exe = mihomo.ensure_binary(ROOT, session) if cands else None
         if cands:
@@ -115,23 +116,31 @@ def _run(cfg, args) -> int:
             log.info("连通性通过：%d / %d", len(alive_ids), len(cands))
             pool.save(pool_path, pl)
         cache_h = cfg["purity"]["cache_hours"]
-        need = [r for r in cands if r["id"] in alive_ids and not pool.fresh_purity(r, cache_h)]
-        log.info("纯净度待测 %d 个，复用缓存 %d 个", len(need), len(alive_ids) - len(need))
+        need = [r for r in cands if r["id"] in alive_ids and not pool.fresh_purity(r, cache_h)] if cfg["purity"]["enabled"] else []
+        if cfg["purity"]["enabled"]:
+            log.info("纯净度待测 %d 个，已有参考评分 %d 个", len(need), len(alive_ids) - len(need))
+        else:
+            log.info("已跳过 IPPure 查询；评分不限制节点入选")
         if need:
             probes = [{**r["proxy"], "name": r["id"]} for r in need]
-            mihomo.probe_purity(exe, probes, cfg,
-                               on_result=lambda nid, data: pool.record_purity(pl, nid, data))
-        promoted = pool.promote_stable(pl, pc, cache_h, cfg["purity"]["max_score"], policy=test_policy)
+            try:
+                mihomo.probe_purity(exe, probes, cfg,
+                                   on_result=lambda nid, data: pool.record_purity(pl, nid, data))
+            except Exception:
+                if cfg["purity"]["required"]:
+                    raise
+                log.warning("参考评分查询失败，继续按连通性与稳定性筛选")
+        promoted = pool.promote_stable(pl, pc, cache_h, score_limit, policy=test_policy)
         retired = pool.prune(pl, pc["max_fail"], stable_max_fail=pc["stable_max_fail"],
                              stable_grace_days=pc["stable_grace_days"], cooldown_hours=pc["cooldown_hours"])
         log.info("晋升稳定节点 %d 个；进入冷却 %d 个", promoted, retired)
-        # 未轮到本次复测的节点，在连通性与纯净度有效期内继续服务。
+        # 未轮到复测的节点在连通性有效期内继续服务；可选评分不阻止输出。
         now = time.time()
         final = [r for r in pl.values() if r.get("last_ok", 0) > 0
                  and pool.tested_with_policy(r, test_policy)
                  and r.get("last_test") == r.get("last_ok") and r.get("fail_streak", 0) == 0
                  and 0 <= now - r["last_ok"] < cfg["output"]["max_test_age_hours"] * 3600
-                 and pool.fresh_purity(r, cache_h) and r["purity"]["score"] <= cfg["purity"]["max_score"]]
+                 and (score_limit is None or (pool.fresh_purity(r, cache_h) and r["purity"]["score"] <= score_limit))]
         log.info("最终入选：%d 个（稳定 %d 个）", len(final), sum(bool(r.get("stable")) for r in final))
         if not final:
             log.error("本轮没有通过有效期内检测的合格节点，保留原订阅，不发布空结果")
@@ -192,13 +201,13 @@ def _run(cfg, args) -> int:
 def _summary(pl, final, stats, link, out_path, cfg, elapsed):
     print("\n" + "=" * 56)
     print(f"  节点池总量 {len(pl)} | 稳定 {sum(bool(r.get('stable')) for r in pl.values())} | 本次输出 {stats['total']} | 用时 {elapsed:.0f}s")
-    for _, _, label in cfg["purity"]["tiers"]:
-        print(f"    {label}: {stats['tiers'].get(label, 0)}")
+    for label, count in stats["tiers"].items():
+        print(f"    {label}: {count}")
     from nodepool.util import flag_emoji
-    for r in sorted(final, key=lambda r: (r["purity"]["score"], r.get("latency_ms") or 9e9))[:10]:
-        p = r["purity"]
+    for r in sorted(final, key=lambda r: (not r.get("stable", False), r.get("latency_ms") or 9e9))[:10]:
+        p = r.get("purity") or {}
         cc = str(p.get("cc") or "??")
-        print(f"    {flag_emoji(cc)} {cc:<3} 系数{p['score']:<3} {r.get('latency_ms')}ms {p.get('org') or ''}")
+        print(f"    {flag_emoji(cc)} {cc:<3} 参考评分{str(p.get('score', '未评分')):<3} {r.get('latency_ms')}ms {p.get('org') or ''}")
     print(f"  本地文件: {out_path}")
     if link:
         if os.environ.get("GITHUB_ACTIONS") == "true":

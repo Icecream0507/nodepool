@@ -55,6 +55,30 @@ def qualified(server="8.8.8.8"):
 
 
 class PoolTests(unittest.TestCase):
+    def test_optional_scores_allow_stable_promotion_for_unscored_or_high_score_nodes(self):
+        cfg = config()
+        for value in (None, {"score": 95, "ts": 1}):
+            with self.subTest(purity=value):
+                rec = record(); rec["purity"] = value; records = {rec["id"]: rec}
+                for _ in range(cfg["pool"]["stable_min_passes"]):
+                    pool.record_test(records, rec["id"], True, 50)
+                self.assertEqual(pool.promote_stable(records, cfg["pool"], 24, None), 1)
+                self.assertTrue(rec["stable"])
+
+    def test_high_score_proven_nodes_keep_known_candidate_quota(self):
+        records = {}
+        for index in range(5):
+            rec = qualified(f"8.8.8.{index + 1}")
+            rec["last_test"] = 2
+            records[rec["id"]] = rec
+        values = list(records.values())
+        high, unknown = values[0], values[-1]
+        high["purity"]["score"] = 95; high["last_test"] = 1
+        unknown["last_ok"] = 0; unknown["last_test"] = 0
+        selected = pool.select_candidates(records, 4, .25, None)
+        self.assertIn(high["id"], {rec["id"] for rec in selected})
+        self.assertIn(unknown["id"], {rec["id"] for rec in selected})
+
     def test_stable_requires_five_passes_and_valid_purity(self):
         r = record(); pl = {r["id"]: r}; cfg = config()
         for _ in range(4):
@@ -223,6 +247,30 @@ class ParserTests(unittest.TestCase):
 
 
 class OutputAndConfigTests(unittest.TestCase):
+    def test_unscored_and_high_score_nodes_are_output_and_stability_has_priority(self):
+        high, low, unscored = qualified("1.1.1.1"), qualified("8.8.8.8"), qualified("9.9.9.9")
+        high.update(stable=True, latency_ms=500)
+        high["purity"]["score"] = 95
+        low["latency_ms"] = 10
+        unscored["purity"] = None
+        cfg = config()
+        text, stats = output.build_subscription([low, unscored, high], cfg)
+        doc = yaml.safe_load(text)
+        self.assertEqual(stats["total"], 3)
+        self.assertEqual(doc["proxies"][0]["server"], "1.1.1.1")
+        others = next(g for g in doc["proxy-groups"] if g["name"] == cfg["output"]["group_other"])
+        self.assertEqual(len(others["proxies"]), 2)
+        self.assertIn("未评分", text)
+        self.assertNotIn("仅收录系数", text)
+        mihomo.validate_subscription(EXE, text) if EXE.exists() else None
+
+    def test_optional_purity_settings_are_validated(self):
+        for key in ("required", "enabled"):
+            cfg = config(); cfg["purity"][key] = "false"
+            with self.subTest(key=key), self.assertRaises(ValueError): validate_config(cfg)
+        cfg = config(); cfg["purity"]["required"] = True
+        with self.assertRaises(ValueError): validate_config(cfg)
+
     def test_offline_validation_disables_dns_geoip_download(self):
         text = output.build_subscription([qualified()], config())[0]
         with patch.object(mihomo, "check_config") as check:
@@ -286,10 +334,26 @@ class MainTests(unittest.TestCase):
         return update._run(self.cfg, SimpleNamespace(skip_collect=True, no_publish=False))
 
     def test_expired_score_failure_keeps_previous_subscription(self):
+        self.cfg["purity"].update(enabled=True, required=True)
         self.rec["purity"]["ts"] -= 25 * 3600
         self.assertEqual(self.run_update(), 4)
         self.assertEqual(self.out.read_text(encoding="utf-8"), "previous subscription")
         self.publisher.assert_not_called()
+
+    def test_optional_high_missing_and_expired_scores_do_not_block_output(self):
+        for value in (None, {"score": 95, "ts": int(time.time())}, {"score": 5, "ts": 1}):
+            with self.subTest(purity=value):
+                self.rec["purity"] = value
+                self.assertEqual(self.run_update(), 0)
+                self.assertEqual(len(yaml.safe_load(self.out.read_text(encoding="utf-8"))["proxies"]), 1)
+                self.probe.assert_not_called()
+
+    def test_optional_reference_query_failure_does_not_block_output(self):
+        self.cfg["purity"]["enabled"] = True
+        self.rec["purity"] = None
+        self.probe.side_effect = RuntimeError("reference service unavailable")
+        self.assertEqual(self.run_update(), 0)
+        self.assertEqual(len(yaml.safe_load(self.out.read_text(encoding="utf-8"))["proxies"]), 1)
 
     def test_failed_publish_returns_failure_and_saves_state(self):
         self.publisher.return_value = None
