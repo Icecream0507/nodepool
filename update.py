@@ -152,6 +152,8 @@ def _run(cfg, args) -> int:
             if token and not args.no_publish and cfg["publish"]["enabled"]:
                 if not publish.publish_candidates(ROOT, session, token, candidate_text, cfg):
                     return 3
+                if remote_ready and not publish.backup_stable_pool(ROOT, session, token, pl, cfg):
+                    log.warning("订阅保持不变；稳定池远端备份未成功，本地状态仍已保存")
             return 4
         if len(final) != cloud_total:
             log.info("本机验证过滤：%d / %d 个进入订阅", len(final), cloud_total)

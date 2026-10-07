@@ -69,6 +69,7 @@ class CloudClientGateTests(unittest.TestCase):
         self.stack.enter_context(patch.object(mihomo, "validate_subscription"))
         self.publisher = self.stack.enter_context(patch.object(publish, "publish", return_value="stub://published"))
         self.candidates = self.stack.enter_context(patch.object(publish, "publish_candidates", return_value=True))
+        self.backup = self.stack.enter_context(patch.object(publish, "backup_stable_pool", return_value=True))
         self.stack.enter_context(patch.object(log, "disabled", True))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
 
@@ -88,6 +89,7 @@ class CloudClientGateTests(unittest.TestCase):
         self.assertEqual(self.run_update(), 4)
         self.publisher.assert_not_called()
         self.candidates.assert_called_once()
+        self.backup.assert_called_once()
         self.assertEqual(len(yaml.safe_load(self.candidates.call_args.args[3])["proxies"]), 3)
         self.assertEqual(self.out.read_text(encoding="utf-8"), "existing subscription")
 
