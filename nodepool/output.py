@@ -20,7 +20,7 @@ PROXY_DOMAINS = (
 )
 
 
-def build_dns_config(group_auto: str) -> dict:
+def build_dns_config(group_select: str) -> dict:
     """Separate node bootstrap DNS from destination DNS to avoid a proxy loop."""
     domestic = ["https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query"]
     return {
@@ -31,8 +31,8 @@ def build_dns_config(group_auto: str) -> dict:
         "proxy-server-nameserver": list(domestic),
         "direct-nameserver": list(domestic),
         "nameserver": [
-            f"https://1.1.1.1/dns-query#{group_auto}",
-            f"https://8.8.8.8/dns-query#{group_auto}",
+            f"https://1.1.1.1/dns-query#{group_select}",
+            f"https://8.8.8.8/dns-query#{group_select}",
         ],
         "nameserver-policy": {"+.cn": list(domestic)},
         # Explicitly avoid GeoIP DNS filtering, including in offline validation.
@@ -40,22 +40,23 @@ def build_dns_config(group_auto: str) -> dict:
     }
 
 
-def proxy_domain_rules(group_auto: str) -> list[str]:
-    return [f"DOMAIN-SUFFIX,{domain},{group_auto}" for domain in PROXY_DOMAINS]
+def proxy_domain_rules(group_select: str) -> list[str]:
+    return [f"DOMAIN-SUFFIX,{domain},{group_select}" for domain in PROXY_DOMAINS]
 
 
-def _auto_layout(document: dict, cfg: dict) -> dict:
-    """Route proxy traffic straight to one automatic group with direct node members."""
+def _selection_layout(document: dict, cfg: dict) -> dict:
+    """Default to automatic selection while keeping nodes directly selectable in rule mode."""
     document = copy.deepcopy(document)
     proxies = document.get("proxies")
     if not isinstance(proxies, list) or not proxies:
         raise ValueError("没有可输出的节点，拒绝生成空订阅")
     group_auto = cfg["output"]["group_auto"]
+    group_select = cfg["output"]["group_select"]
     names = []
     for proxy in proxies:
         if (not isinstance(proxy, dict) or not isinstance(proxy.get("name"), str)
-                or not proxy["name"] or proxy["name"] in (group_auto, "DIRECT", "REJECT", "GLOBAL")):
-            raise ValueError("节点名称无效或与自动组冲突")
+                or not proxy["name"] or proxy["name"] in (group_auto, group_select, "DIRECT", "REJECT", "GLOBAL")):
+            raise ValueError("节点名称无效或与代理组冲突")
         names.append(proxy["name"])
     if len(set(names)) != len(names):
         raise ValueError("节点名称重复")
@@ -65,17 +66,20 @@ def _auto_layout(document: dict, cfg: dict) -> dict:
     if cfg["connectivity"].get("expected_status") is not None:
         group["expected-status"] = cfg["connectivity"]["expected_status"]
     document["mode"] = "rule"
-    document["proxy-groups"] = [group]
-    document["dns"] = build_dns_config(group_auto)
+    document["proxy-groups"] = [
+        {"name": group_select, "type": "select", "proxies": [group_auto, *names]},
+        group,
+    ]
+    document["dns"] = build_dns_config(group_select)
     document["rules"] = [
-        *proxy_domain_rules(group_auto),
+        *proxy_domain_rules(group_select),
         "DOMAIN-SUFFIX,cn,DIRECT",
         "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
         "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
         "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
         "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
         "GEOIP,CN,DIRECT",
-        f"MATCH,{group_auto}",
+        f"MATCH,{group_select}",
     ]
     return document
 
@@ -85,7 +89,7 @@ def simplify_subscription(text: str, cfg: dict) -> str:
     document = yaml.safe_load(text)
     if not isinstance(document, dict):
         raise ValueError("订阅必须是 YAML 对象")
-    return yaml.safe_dump(_auto_layout(document, cfg), allow_unicode=True, sort_keys=False)
+    return yaml.safe_dump(_selection_layout(document, cfg), allow_unicode=True, sort_keys=False)
 
 
 def tier_of(score: int | None, tiers: list) -> tuple[int, str] | None:
@@ -124,6 +128,7 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     """final：通过筛选的 record 列表。返回 (yaml 文本, 统计)。"""
     tiers = cfg["purity"]["tiers"]
     g_auto = cfg["output"]["group_auto"]
+    g_select = cfg["output"]["group_select"]
     g_other = cfg["output"].get("group_other", "其他节点")
 
     # Stability and measured latency take priority over reference IP scores.
@@ -135,7 +140,7 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     final = sorted(final, key=sort_key)
 
     labels = [t[2] for t in tiers] + [g_other]
-    used: set = {g_auto, "DIRECT", "REJECT", "GLOBAL"}
+    used: set = {g_auto, g_select, "DIRECT", "REJECT", "GLOBAL"}
     proxies = []
     stats = {label: 0 for label in labels}
     for rec in final:
@@ -150,7 +155,7 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
         proxies.append(pd)
         stats[label] += 1
 
-    config = _auto_layout({
+    config = _selection_layout({
         "mixed-port": 7890,
         "allow-lan": False,
         "mode": "rule",

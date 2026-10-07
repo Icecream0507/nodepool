@@ -60,7 +60,8 @@ mihomo:
 
 output:
   file: "output/clash.yaml"
-  # 唯一代理组：规则直接交给它自动选择节点，无需手动切换子组
+  # 规则入口默认自动，也能直接点击节点手动固定；不生成评分或稳定子组
+  group_select: "🚀 节点选择"
   group_auto: "♻️ 自动选择"
   max_test_age_hours: 12 # 未轮到复测的节点，最近测活有效期
 

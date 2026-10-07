@@ -16,7 +16,7 @@ DEFAULTS = {
     "pool": {"stable_min_passes": 5, "stable_min_rate": 0.8, "history_size": 20,
              "stable_max_fail": 12, "stable_grace_days": 7, "cooldown_hours": 24,
              "exploration_ratio": 0.25},
-    "output": {"group_select": "🔰 手动选择", "group_stable": "🛡️ 稳定节点",
+    "output": {"group_select": "🚀 节点选择", "group_stable": "🛡️ 稳定节点",
                "max_test_age_hours": 12, "group_other": "其他节点"},
     "purity": {"batch_size": 16, "max_seconds": 420, "enabled": True, "required": True},
     "search": {"max_seconds": 420},
