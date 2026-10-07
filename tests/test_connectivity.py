@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -223,7 +224,26 @@ class RealRequestTests(unittest.TestCase):
 
 @unittest.skipUnless(EXE.exists(), "mihomo binary is not installed")
 class NativeStatusTests(unittest.TestCase):
+    def test_numeric_looking_names_survive_config_checks_and_process_rewrite(self):
+        names = ("0089885980956613", "0123456789", "1e3", "1.0", ".NaN", "true")
+        proxies = [{"name": name, "type": "http", "server": "127.0.0.1", "port": 9,
+                    "username": "00089", "password": "0089885980956613"} for name in names]
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            controller = f"127.0.0.1:{sock.getsockname()[1]}"
+        text, _ = mihomo.build_purity_config(proxies, controller, "unused", 26000)
+        mihomo.check_config(EXE, text)
+        # Avoid opening the fixed listener ports for this API-only check.
+        document = yaml.safe_load(text)
+        document["listeners"] = []
+        document["rules"] = ["MATCH,DIRECT"]
+        with mihomo.Mihomo(EXE, yaml.safe_dump(document), controller, "unused") as api:
+            response = api.sess.get(api.base + "/proxies", timeout=3)
+            response.raise_for_status()
+            self.assertTrue(set(names).issubset(response.json()["proxies"]))
+
     def test_real_listeners_isolate_nodes_and_reject_error_pages_and_redirects(self):
+        auth_headers = []
         class Target(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.server.paths.append(self.path)
@@ -240,6 +260,7 @@ class NativeStatusTests(unittest.TestCase):
 
         class Upstream(BaseHTTPRequestHandler):
             def do_CONNECT(self):
+                auth_headers.append(self.headers.get("Proxy-Authorization"))
                 # The target name deliberately does not resolve locally. Only
                 # the selected upstream can deliver its test response.
                 try:
@@ -266,7 +287,8 @@ class NativeStatusTests(unittest.TestCase):
         with ExitStack() as stack:
             servers = []
             proxies = []
-            for name, status in (("good", 204), ("bad", 200)):
+            good_name, bad_name = "0089885980956613", "1e3"
+            for name, status in ((good_name, 204), (bad_name, 200)):
                 target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
                 target.paths, target.status = [], status
                 upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
@@ -279,7 +301,8 @@ class NativeStatusTests(unittest.TestCase):
                     stack.callback(server.shutdown)
                 servers.append(target)
                 proxies.append({"name": name, "type": "http", "server": "127.0.0.1",
-                                "port": upstream.server_port})
+                                "port": upstream.server_port, "username": "00089",
+                                "password": "0089885980956613"})
             cfg = load_config(ROOT / "config.yaml")
             with socket.socket() as controller:
                 controller.bind(("127.0.0.1", 0))
@@ -307,13 +330,16 @@ class NativeStatusTests(unittest.TestCase):
                                            "HTTPS_PROXY": "http://127.0.0.1:1",
                                            "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""}):
                 results = mihomo.test_connectivity(EXE, proxies, cfg)
-                self.assertTrue(all(delay is not None for delay in results["good"]))
-                self.assertEqual(results["bad"], [None, None])
+                self.assertTrue(all(delay is not None for delay in results[good_name]))
+                self.assertEqual(results[bad_name], [None, None])
                 cfg["connectivity"]["test_url"] = "http://health.invalid/redirect"
                 redirects = mihomo.test_connectivity(EXE, proxies[:1], cfg)
-                self.assertEqual(redirects["good"], [None, None])
+                self.assertEqual(redirects[good_name], [None, None])
             self.assertEqual(servers[0].paths, ["/204", "/204", "/redirect", "/redirect"])
             self.assertEqual(servers[1].paths, ["/204", "/204"])
+            expected_auth = "Basic " + base64.b64encode(b"00089:0089885980956613").decode("ascii")
+            self.assertGreaterEqual(len(auth_headers), 6)
+            self.assertTrue(all(header == expected_auth for header in auth_headers))
 
     def test_http_error_page_cannot_pass_expected_204(self):
         class Handler(BaseHTTPRequestHandler):

@@ -13,7 +13,7 @@ from urllib.parse import unquote
 import yaml
 
 from .pool import connectivity_policy
-from .util import atomic_write, node_id
+from .util import atomic_write, dump_yaml, node_id
 
 _ID = re.compile(r"[0-9a-f]{16}\Z")
 _BUILTINS = {"DIRECT", "REJECT"}
@@ -230,4 +230,4 @@ def filter_subscription(text: str, report: dict | None, policy: str, *,
     for key in ("rules", "sub-rules"):
         if key in doc:
             doc[key] = _repair_rules(doc[key], removed, fallback)
-    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+    return dump_yaml(doc)

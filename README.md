@@ -77,6 +77,7 @@ python -m unittest discover -s tests -v
 ```
 
 测试不访问真实 Gist 或代理节点。检测到本地 mihomo 时还会进行配置检查与进程生命周期测试。
+云端更新会先准备 mihomo，再运行包含原生内核的回归检查，验证配置解析、节点路由和 HTTP 状态。
 
 ## 配置 GitHub Token（发布订阅需要）
 

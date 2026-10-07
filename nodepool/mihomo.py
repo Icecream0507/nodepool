@@ -24,7 +24,7 @@ from pathlib import Path
 import requests
 import yaml
 
-from .util import get_with_retry, log
+from .util import dump_yaml, get_with_retry, log
 from .pool import purity_from_api
 
 RELEASE_API = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
@@ -116,7 +116,7 @@ class Mihomo:
         with open(self._cfg_path, "w", encoding="utf-8") as f:
             config = yaml.safe_load(cfg_text)
             config["secret"] = self.secret
-            f.write(yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
+            f.write(dump_yaml(config))
         self._proc: subprocess.Popen | None = None
         self.base = f"http://{controller}"
         self.sess = requests.Session()
@@ -285,7 +285,7 @@ def validate_subscription(exe: Path, text: str, timeout: int = 20) -> None:
     if config.get("dns", {}).get("fallback"):
         # DNS fallback 默认也会加载 GeoIP，即使 rules 中没有 GEOIP。
         config["dns"].setdefault("fallback-filter", {})["geoip"] = False
-    check_config(exe, yaml.safe_dump(config, allow_unicode=True, sort_keys=False), timeout)
+    check_config(exe, dump_yaml(config), timeout)
 
 
 def build_test_config(proxies: list[dict], controller: str, secret: str) -> str:
@@ -296,7 +296,7 @@ def build_test_config(proxies: list[dict], controller: str, secret: str) -> str:
     cfg["proxy-groups"] = [{"name": "GLOBAL", "type": "select",
                              "proxies": ["DIRECT"] + [p["name"] for p in proxies]}]
     cfg["rules"] = ["MATCH,DIRECT"]
-    return yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    return dump_yaml(cfg)
 
 
 def build_purity_config(proxies: list[dict], controller: str, secret: str,
@@ -325,7 +325,7 @@ def build_purity_config(proxies: list[dict], controller: str, secret: str,
         port_map[p["name"]] = port
     cfg["listeners"] = listeners
     cfg["rules"] = rules + ["MATCH,DIRECT"]
-    return yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), port_map
+    return dump_yaml(cfg), port_map
 
 
 # ---------------------------------------------------------------- 测延迟

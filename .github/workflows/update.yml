@@ -26,9 +26,6 @@ jobs:
       - name: Install deps
         run: python -m pip install -r requirements.txt
 
-      - name: Validate logic
-        run: python -m unittest discover -s tests -v
-
       # 跨运行保留节点池/纯净度缓存（尽力而为；丢了也不影响订阅链接）
       - name: Restore pool cache
         id: pool-cache
@@ -45,6 +42,12 @@ jobs:
         with:
           path: bin
           key: ${{ runner.os }}-${{ runner.arch }}-mihomo-${{ hashFiles('nodepool/mihomo.py') }}
+
+      - name: Prepare mihomo for native validation
+        run: python -c "from pathlib import Path; from nodepool.mihomo import ensure_binary; from nodepool.util import make_session; ensure_binary(Path('.'), make_session(None))"
+
+      - name: Validate logic and native core
+        run: python -m unittest discover -s tests -v
 
       - name: Run update (直连，云端无需代理)
         env:

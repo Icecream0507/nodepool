@@ -14,6 +14,25 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import requests
+import yaml
+
+
+class _StringDumper(yaml.SafeDumper):
+    pass
+
+
+def _quoted_string(dumper, value):
+    # PyYAML and Go YAML disagree on strings such as 0089 and 1e3.
+    # Quote strings at every emission so node IDs and credentials stay exact.
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style='"')
+
+
+_StringDumper.add_representer(str, _quoted_string)
+
+
+def dump_yaml(value) -> str:
+    """Emit safe YAML without implicit scalar conversion in mihomo's Go parser."""
+    return yaml.dump(value, Dumper=_StringDumper, allow_unicode=True, sort_keys=False)
 
 # ---------------------------------------------------------------- 日志
 

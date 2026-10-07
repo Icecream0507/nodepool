@@ -6,7 +6,7 @@ import time
 
 import yaml
 
-from .util import flag_emoji
+from .util import dump_yaml, flag_emoji
 
 TEST_URL = "https://www.gstatic.com/generate_204"
 
@@ -89,7 +89,7 @@ def simplify_subscription(text: str, cfg: dict) -> str:
     document = yaml.safe_load(text)
     if not isinstance(document, dict):
         raise ValueError("订阅必须是 YAML 对象")
-    return yaml.safe_dump(_selection_layout(document, cfg), allow_unicode=True, sort_keys=False)
+    return dump_yaml(_selection_layout(document, cfg))
 
 
 def tier_of(score: int | None, tiers: list) -> tuple[int, str] | None:
@@ -162,7 +162,7 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
         "log-level": "info",
         "proxies": proxies,
     }, cfg)
-    body = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
+    body = dump_yaml(config)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     dist = " / ".join(f"{lbl}:{stats[lbl]}" for lbl in labels if stats[lbl])
     score_note = (f"IPPure 系数越低越纯净；仅收录系数 <= {cfg['purity']['max_score']} 的节点"
