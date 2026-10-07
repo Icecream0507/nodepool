@@ -98,6 +98,34 @@ class CloudClientGateTests(unittest.TestCase):
         self.publisher.assert_not_called(); self.candidates.assert_not_called()
         self.assertEqual(self.out.read_text(encoding="utf-8"), "existing subscription")
 
+    def test_missing_remote_report_cannot_disable_previously_required_gate(self):
+        health_path = self.root / "data/client-health.json"
+        client_health.save_report(health_path, report(self.cfg))
+        original_health = health_path.read_text(encoding="utf-8")
+        self.restore.return_value = None
+        with self.assertRaises(RuntimeError):
+            self.run_update()
+        self.publisher.assert_not_called(); self.candidates.assert_not_called()
+        self.assertEqual(self.out.read_text(encoding="utf-8"), "existing subscription")
+        self.assertEqual(health_path.read_text(encoding="utf-8"), original_health)
+
+    def test_preferred_known_nodes_remain_scheduled_without_losing_exploration(self):
+        known = {f"known-{i}": {"id": f"known-{i}", "last_ok": 100, "last_test": 100}
+                 for i in range(20)}
+        preferred = {"id": "preferred", "last_ok": 1000, "last_test": 1000}
+        known[preferred["id"]] = preferred
+        new = {f"new-{i}": {"id": f"new-{i}", "last_ok": 0, "last_test": 0}
+               for i in range(100)}
+        records = {**known, **new}
+        baseline = pool.select_candidates(records, 4, .25)
+        self.assertNotIn("preferred", {rec["id"] for rec in baseline})
+        selected = pool.select_candidates(records, 4, .25, preferred_ids={"preferred"})
+        ids = {rec["id"] for rec in selected}
+        self.assertEqual(len(selected), 4)
+        self.assertIn("preferred", ids)
+        self.assertEqual(len(ids & new.keys()), 1)
+        self.assertEqual(len(ids & known.keys()), 3)
+
 
 class PublishingClientGateTests(unittest.TestCase):
     def setUp(self):
@@ -140,6 +168,15 @@ class PublishingClientGateTests(unittest.TestCase):
         self.assertTrue(publish.publish_candidates(self.root, Mock(), "test", self.content, self.cfg))
         payload = self.request.call_args.args[4]
         self.assertEqual(set(payload["files"]), {self.cfg["publish"]["candidate_filename"]})
+
+    def test_final_missing_remote_report_cannot_bypass_local_required_gate(self):
+        health_path = self.root / "data/client-health.json"
+        client_health.save_report(health_path, report(self.cfg))
+        original_health = health_path.read_text(encoding="utf-8")
+        self.configure(None)
+        self.assertIsNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg, candidates=self.content))
+        self.assertEqual([call.args[1] for call in self.request.call_args_list], ["GET"])
+        self.assertEqual(health_path.read_text(encoding="utf-8"), original_health)
 
     def test_older_explicit_report_cannot_overwrite_newer_remote_decision(self):
         newer = report(self.cfg, accepted=(1,))
