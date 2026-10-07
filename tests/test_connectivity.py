@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import select
 import socket
 import sys
 import tempfile
@@ -128,13 +130,16 @@ class ConnectivityRoundTests(unittest.TestCase):
         cfg = load_config(ROOT / "config.yaml")
         calls = []
 
-        def delay(name, url, timeout_ms, expected_status):
+        def request(port, url, timeout_ms, expected_status):
+            name = "one" if port == cfg["mihomo"]["base_listen_port"] else "both"
             calls.append((name, url, expected_status))
             return 20 if name == "both" or url == cfg["connectivity"]["test_url"] else None
 
         api = Mock()
-        api.delay.side_effect = delay
-        with patch.object(mihomo, "Mihomo") as process:
+        api.delay.side_effect = AssertionError("the delay API is not an HTTP proof")
+        with patch.object(mihomo, "Mihomo") as process, \
+                patch.object(mihomo, "_connectivity_get", side_effect=request), \
+                patch.object(mihomo.socket, "socket"):
             process.return_value.__enter__.return_value = api
             results = mihomo.test_connectivity(Path("unused"), [{"name": "one"}, {"name": "both"}], cfg)
         self.assertEqual(results["one"], [20, None, 20, None])
@@ -144,9 +149,172 @@ class ConnectivityRoundTests(unittest.TestCase):
                          [DEFAULT_TEST_URL, DEFAULT_VERIFICATION_URL] * 2)
         self.assertTrue(all(status == 204 for name, url, status in calls))
 
+    def test_candidates_are_split_into_bounded_independent_listener_batches(self):
+        cfg = load_config(ROOT / "config.yaml")
+        proxies = [{"name": f"node-{n}"} for n in range(65)]
+        with patch.object(mihomo, "Mihomo") as process, \
+                patch.object(mihomo, "_connectivity_get", return_value=10), \
+                patch.object(mihomo.socket, "socket"):
+            result = mihomo.test_connectivity(Path("unused"), proxies, cfg)
+        self.assertEqual(len(result), 65)
+        self.assertTrue(all(value == [10] * 4 for value in result.values()))
+        configs = [yaml.safe_load(call.args[1]) for call in process.call_args_list]
+        self.assertEqual([len(c["listeners"]) for c in configs], [64, 1])
+        self.assertEqual(configs[0]["rules"][0], "IN-NAME,in-0,node-0")
+        self.assertEqual(configs[0]["rules"][63], "IN-NAME,in-63,node-63")
+        self.assertEqual(configs[1]["rules"][0], "IN-NAME,in-0,node-64")
+
+    def test_occupied_listener_port_fails_before_starting_core(self):
+        cfg = load_config(ROOT / "config.yaml")
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            cfg["mihomo"]["base_listen_port"] = occupied.getsockname()[1]
+            with patch.object(mihomo, "Mihomo") as process, self.assertRaises(OSError):
+                mihomo.test_connectivity(Path("unused"), [{"name": "a"}], cfg)
+            process.assert_not_called()
+
+    def test_controller_cannot_share_a_connectivity_listener_port(self):
+        cfg = load_config(ROOT / "config.yaml")
+        cfg["mihomo"]["controller"] = f"127.0.0.1:{cfg['mihomo']['base_listen_port']}"
+        with patch.object(mihomo, "Mihomo") as process, self.assertRaises(ValueError):
+            mihomo.test_connectivity(Path("unused"), [{"name": "a"}], cfg)
+        process.assert_not_called()
+
+
+class RealRequestTests(unittest.TestCase):
+    def make_session(self, status=204):
+        factory = patch.object(mihomo.requests, "Session")
+        self.addCleanup(factory.stop)
+        session = factory.start().return_value.__enter__.return_value
+        response = session.get.return_value.__enter__.return_value
+        response.status_code = status
+        return session
+
+    def test_https_checks_certificates_uses_only_node_proxy_and_measures_handshake(self):
+        session = self.make_session()
+        with patch.object(mihomo.time, "monotonic", side_effect=[10, 10.123]):
+            self.assertEqual(mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 5000, 204), 123)
+        self.assertFalse(session.trust_env)
+        self.assertEqual(session.proxies, {"http": "http://127.0.0.1:23456",
+                                           "https": "http://127.0.0.1:23456"})
+        session.get.assert_called_once_with(DEFAULT_TEST_URL, timeout=(5, 5),
+                                            verify=True, allow_redirects=False, stream=True)
+
+    def test_fake_success_redirect_and_tls_failures_cannot_pass(self):
+        session = self.make_session()
+        for status in (200, 301, 302, 403, 500):
+            session.get.return_value.__enter__.return_value.status_code = status
+            with self.subTest(status=status):
+                self.assertIsNone(mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 1000, 204))
+        for error in (requests.exceptions.SSLError(), requests.Timeout(), requests.exceptions.ProxyError()):
+            session.get.side_effect = error
+            with self.subTest(error=type(error).__name__):
+                self.assertIsNone(mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 1000, 204))
+
+    def test_custom_unspecified_status_accepts_only_success_and_never_redirects(self):
+        session = self.make_session()
+        for status, expected in ((200, True), (204, True), (302, False), (503, False)):
+            session.get.return_value.__enter__.return_value.status_code = status
+            with self.subTest(status=status):
+                actual = mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 1000, None)
+                self.assertEqual(actual is not None, expected)
+
 
 @unittest.skipUnless(EXE.exists(), "mihomo binary is not installed")
 class NativeStatusTests(unittest.TestCase):
+    def test_real_listeners_isolate_nodes_and_reject_error_pages_and_redirects(self):
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.paths.append(self.path)
+                time.sleep(0.02)
+                status = 302 if self.path == "/redirect" else self.server.status
+                self.send_response(status)
+                if status == 302:
+                    self.send_header("Location", "/204")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_CONNECT(self):
+                # The target name deliberately does not resolve locally. Only
+                # the selected upstream can deliver its test response.
+                try:
+                    with socket.create_connection(self.server.target, timeout=2) as remote:
+                        self.send_response(200)
+                        self.end_headers()
+                        while True:
+                            ready, _, _ = select.select([self.connection, remote], [], [], 2)
+                            if not ready:
+                                break
+                            for incoming in ready:
+                                data = incoming.recv(65536)
+                                if not data:
+                                    return
+                                (remote if incoming is self.connection else self.connection).sendall(data)
+                except OSError:
+                    pass
+                finally:
+                    self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        with ExitStack() as stack:
+            servers = []
+            proxies = []
+            for name, status in (("good", 204), ("bad", 200)):
+                target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+                target.paths, target.status = [], status
+                upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+                upstream.target = ("127.0.0.1", target.server_port)
+                for server in (target, upstream):
+                    worker = threading.Thread(target=server.serve_forever, daemon=True)
+                    worker.start()
+                    stack.callback(worker.join, timeout=5)
+                    stack.callback(server.server_close)
+                    stack.callback(server.shutdown)
+                servers.append(target)
+                proxies.append({"name": name, "type": "http", "server": "127.0.0.1",
+                                "port": upstream.server_port})
+            cfg = load_config(ROOT / "config.yaml")
+            with socket.socket() as controller:
+                controller.bind(("127.0.0.1", 0))
+                controller_port = controller.getsockname()[1]
+                cfg["mihomo"]["controller"] = f"127.0.0.1:{controller_port}"
+            for _ in range(100):
+                with socket.socket() as first:
+                    first.bind(("127.0.0.1", 0))
+                    base_port = first.getsockname()[1]
+                    if base_port == 65535 or base_port <= controller_port < base_port + 2:
+                        continue
+                    try:
+                        with socket.socket() as second:
+                            second.bind(("127.0.0.1", base_port + 1))
+                    except OSError:
+                        continue
+                    break
+            else:
+                self.fail("could not reserve adjacent local test ports")
+            cfg["mihomo"]["base_listen_port"] = base_port
+            cfg["connectivity"].update(test_url="http://health.invalid/204", verification_url=None,
+                                       expected_status=204, rounds=2, min_pass=2,
+                                       timeout_ms=1000, concurrency=2)
+            with patch.dict("os.environ", {"HTTP_PROXY": "http://127.0.0.1:1",
+                                           "HTTPS_PROXY": "http://127.0.0.1:1",
+                                           "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""}):
+                results = mihomo.test_connectivity(EXE, proxies, cfg)
+                self.assertTrue(all(delay is not None for delay in results["good"]))
+                self.assertEqual(results["bad"], [None, None])
+                cfg["connectivity"]["test_url"] = "http://health.invalid/redirect"
+                redirects = mihomo.test_connectivity(EXE, proxies[:1], cfg)
+                self.assertEqual(redirects["good"], [None, None])
+            self.assertEqual(servers[0].paths, ["/204", "/204", "/redirect", "/redirect"])
+            self.assertEqual(servers[1].paths, ["/204", "/204"])
+
     def test_http_error_page_cannot_pass_expected_204(self):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):

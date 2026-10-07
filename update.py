@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from nodepool import collect, mihomo, output, pool, publish
+from nodepool import client_health, collect, mihomo, output, pool, publish
 from nodepool.config import load_config, validate_config
 from nodepool.util import atomic_write, log, make_session, run_lock
 
@@ -55,6 +55,15 @@ def _run(cfg, args) -> int:
     pc = cfg["pool"]
     test_policy = pool.connectivity_policy(cfg["connectivity"])
     try:
+        report_path = ROOT / "data" / "client-health.json"
+        if token:
+            report = publish.restore_client_health(ROOT, session, token, cfg)
+            if report is not None:
+                client_health.save_report(report_path, report)
+            elif report_path.exists() and client_health.load_report(report_path)["required"]:
+                raise RuntimeError("已启用的远端客户端验证文件缺失，保留原订阅；禁用请显式设置 required=false")
+        else:
+            report = client_health.load_report(report_path) if report_path.exists() else None
         remote_ready = True
         if token:
             try:
@@ -84,8 +93,12 @@ def _run(cfg, args) -> int:
             return 2
         pool.enforce_limits(pl, pc["max_size"], pc["stale_days"])
         pool.save(pool_path, pl)
+        preferred = client_health.filter_records(list(pl.values()), report, test_policy,
+                                                 max_age_hours=cfg["publish"]["client_health_max_age_hours"])
+        preferred_ids = {r["id"] for r in preferred} if report and report["required"] else set()
+        selection_args = {"preferred_ids": preferred_ids} if preferred_ids else {}
         cands = pool.select_candidates(pl, cfg["collect"]["max_candidates"],
-                                       pc["exploration_ratio"], cfg["purity"]["max_score"])
+                                       pc["exploration_ratio"], cfg["purity"]["max_score"], **selection_args)
         alive_ids = set()
         exe = mihomo.ensure_binary(ROOT, session) if cands else None
         if cands:
@@ -126,6 +139,22 @@ def _run(cfg, args) -> int:
                 if not publish.backup_stable_pool(ROOT, session, token, pl, cfg):
                     log.error("远端稳定池备份未成功，本地状态仍会保存")
             return 4
+        candidate_text, _ = output.build_subscription(final, cfg)
+        if exe is None:
+            exe = mihomo.ensure_binary(ROOT, session)
+        mihomo.validate_subscription(exe, candidate_text, cfg["mihomo"]["startup_timeout"])
+        atomic_write(ROOT / "output" / "candidates.yaml", candidate_text)
+        cloud_total = len(final)
+        final = client_health.filter_records(final, report, test_policy,
+                                             max_age_hours=cfg["publish"]["client_health_max_age_hours"])
+        if not final:
+            log.warning("云端合格 %d 个，本机验证白名单没有有效匹配；保留原订阅，候选等待本机复测", cloud_total)
+            if token and not args.no_publish and cfg["publish"]["enabled"]:
+                if not publish.publish_candidates(ROOT, session, token, candidate_text, cfg):
+                    return 3
+            return 4
+        if len(final) != cloud_total:
+            log.info("本机验证过滤：%d / %d 个进入订阅", len(final), cloud_total)
         sub_text, stats = output.build_subscription(final, cfg)
         if not stats["total"]:
             raise RuntimeError("订阅没有可输出的节点")
@@ -144,7 +173,7 @@ def _run(cfg, args) -> int:
                 status = 3
             else:
                 link = publish.publish(ROOT, session, token, sub_text, cfg,
-                                       records=pl if remote_ready else None)
+                                       records=pl if remote_ready else None, candidates=candidate_text)
                 if not link:
                     status = 3
         _summary(pl, final, stats, link, out_path, cfg, time.time() - t0)

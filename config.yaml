@@ -2,7 +2,7 @@
 
 # 访问 GitHub / gist 用的代理（你的客户端系统代理端口）。
 # 置空字符串则直连。
-proxy: "http://127.0.0.1:3182"
+proxy: "http://127.0.0.1:7897"
 
 search:
   query: "vless://"      # gist 全文搜索关键词
@@ -68,4 +68,7 @@ publish:
   enabled: true                 # 有 token 就自动发布到 secret gist
   gist_filename: "clash.yaml"
   pool_filename: "stable-pool.json" # 同一 secret gist 备份稳定节点，缓存丢失时恢复
+  candidate_filename: "candidates.yaml" # 云端合格候选，供本机复测，不直接导入客户端
+  client_health_filename: "client-health.json" # 本机验证白名单，verify.py 写入后启用
+  client_health_max_age_hours: 168 # 本机证明有效期；云端仍独立复测，过期保留原订阅
   gist_description: "nodepool auto-updated clash subscription"

@@ -118,8 +118,72 @@ def backup_stable_pool(root: Path, session, token: str, records: dict, cfg: dict
     return response is not None and response.status_code == 200
 
 
+def _file_content(data: dict, filename: str, session, token: str) -> str | None:
+    file = (data.get("files") or {}).get(filename)
+    if file is None:
+        return None
+    if not isinstance(file, dict):
+        raise ValueError("Gist 文件格式异常")
+    if file.get("truncated"):
+        raw = _request(session, "GET", file["raw_url"], token)
+        if raw is None or raw.status_code != 200:
+            raise ValueError("无法读取完整 Gist 文件")
+        return raw.content.decode("utf-8")
+    content = file.get("content")
+    if not isinstance(content, str):
+        raise ValueError("Gist 文件内容异常")
+    return content
+
+
+def read_remote_file(root: Path, session, token: str, cfg: dict, filename: str) -> str | None:
+    gid = _fixed_id(root)
+    if not gid:
+        return None
+    response = _request(session, "GET", f"{API}/{gid}", token)
+    try:
+        if response is None or response.status_code != 200:
+            raise ValueError("不可访问")
+        data = response.json()
+        if not isinstance(data, dict) or data.get("public") is not False:
+            raise ValueError("目标不是 secret gist")
+        return _file_content(data, filename, session, token)
+    except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+        raise RuntimeError("无法安全读取远端验证状态，保留现有订阅") from exc
+
+
+def restore_client_health(root: Path, session, token: str, cfg: dict) -> dict | None:
+    from .client_health import validate_report
+    text = read_remote_file(root, session, token, cfg, cfg["publish"]["client_health_filename"])
+    if text is None:
+        return None
+    try:
+        return validate_report(json.loads(text))
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("远端客户端验证记录损坏，保留现有订阅") from exc
+
+
+def publish_candidates(root: Path, session, token: str, content: str, cfg: dict) -> bool:
+    """Keep new cloud discoveries available for local verification without changing the subscription."""
+    document = yaml.safe_load(content)
+    if not isinstance(document, dict) or not document.get("proxies"):
+        raise ValueError("拒绝发布空候选")
+    gid = _fixed_id(root)
+    if not gid:
+        return False
+    existing = _request(session, "GET", f"{API}/{gid}", token)
+    try:
+        if existing is None or existing.status_code != 200 or existing.json().get("public") is not False:
+            return False
+    except (ValueError, AttributeError):
+        return False
+    result = _request(session, "PATCH", f"{API}/{gid}", token,
+                      {"files": {cfg["publish"]["candidate_filename"]: {"content": content}}})
+    return result is not None and result.status_code == 200
+
+
 def publish(root: Path, session, token: str, content: str, cfg: dict,
-            records: dict | None = None) -> str | None:
+            records: dict | None = None, candidates: str | None = None,
+            client_report: dict | None = None) -> str | None:
     document = yaml.safe_load(content)
     if not isinstance(document, dict) or not document.get("proxies"):
         raise ValueError("拒绝发布空订阅")
@@ -137,6 +201,11 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
                 return None
     gid = os.environ.get("NODEPOOL_GIST_ID") or state.get("id")
     payload = {"description": cfg["publish"]["gist_description"], "files": {fn: {"content": content}}}
+    if candidates is not None:
+        candidate_doc = yaml.safe_load(candidates)
+        if not isinstance(candidate_doc, dict) or not candidate_doc.get("proxies"):
+            raise ValueError("拒绝发布空候选")
+        payload["files"][cfg["publish"]["candidate_filename"]] = {"content": candidates}
     if records is not None:
         payload["files"].update(_stable_file(records, cfg))
     if gid:
@@ -146,11 +215,36 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
             log.error("固定 Gist 不可访问，保留订阅地址并停止发布")
             return None
         try:
-            if existing.json().get("public") is not False:
+            data = existing.json()
+            if data.get("public") is not False:
                 log.error("目标 Gist 不是 secret，停止发布")
                 return None
-        except (ValueError, AttributeError):
-            log.error("Gist 返回格式异常")
+            # Re-read immediately before writing: an older cloud run must not
+            # bypass a whitelist uploaded while it was testing candidates.
+            from .client_health import filter_subscription, load_report, validate_report
+            from .pool import connectivity_policy
+            report = client_report
+            remote_report = _file_content(data, cfg["publish"]["client_health_filename"], session, token)
+            previous_report = validate_report(json.loads(remote_report)) if remote_report is not None else None
+            local_report_path = root / "data" / "client-health.json"
+            if previous_report is None and client_report is None and local_report_path.exists():
+                if load_report(local_report_path)["required"]:
+                    raise ValueError("已启用的远端验证文件缺失")
+            if report is None:
+                report = previous_report
+            else:
+                report = validate_report(report)
+                if previous_report is not None and previous_report["tested_at"] > report["tested_at"]:
+                    raise ValueError("已有更新的客户端验证记录")
+                payload["files"][cfg["publish"]["client_health_filename"]] = {
+                    "content": json.dumps(report, ensure_ascii=False, separators=(",", ":"))}
+            if report is not None:
+                payload["files"][fn]["content"] = filter_subscription(
+                    candidates if candidates is not None else content, report,
+                    connectivity_policy(cfg["connectivity"]),
+                    max_age_hours=cfg["publish"]["client_health_max_age_hours"])
+        except (ValueError, AttributeError, KeyError, TypeError):
+            log.error("Gist 或客户端验证状态异常/无合格节点，保留原订阅")
             return None
         r = _request(session, "PATCH", f"{API}/{gid}", token, payload)
     else:

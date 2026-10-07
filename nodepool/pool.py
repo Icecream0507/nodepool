@@ -12,7 +12,7 @@ from .util import atomic_write, log, node_id, node_key
 
 def connectivity_policy(cfg: dict) -> str:
     """Identify the evidence required for publication without deleting old tests."""
-    policy = {"schema": 2, **{key: cfg.get(key) for key in (
+    policy = {"schema": 3, "probe": "verified-http-get", **{key: cfg.get(key) for key in (
         "test_url", "verification_url", "timeout_ms", "rounds", "min_pass")},
         "expected_status": cfg.get("expected_status", 204)}
     encoded = json.dumps(policy, sort_keys=True, separators=(",", ":"))
@@ -242,7 +242,8 @@ def enforce_limits(pool: dict[str, dict], max_size: int, stale_days: float) -> i
 
 
 def select_candidates(pool: dict[str, dict], max_candidates: int,
-                      exploration_ratio: float = 0.25, max_score: int = 40) -> list[dict]:
+                      exploration_ratio: float = 0.25, max_score: int = 40, *,
+                      preferred_ids: set[str] | None = None) -> list[dict]:
     if max_candidates < 1 or not 0 < exploration_ratio < 1:
         raise ValueError("候选上限必须为正，探索比例必须在 0 和 1 之间")
     now = time.time()
@@ -253,7 +254,8 @@ def select_candidates(pool: dict[str, dict], max_candidates: int,
         return bool(r.get("last_ok")) and (score is None or (type(score) is int and 0 <= score <= max_score))
     known = [r for r in eligible if proven(r)]
     explore = [r for r in eligible if not proven(r)]
-    known.sort(key=lambda r: (r.get("last_test", 0), not r.get("stable", False), r["id"]))
+    preferred_ids = preferred_ids or set()
+    known.sort(key=lambda r: (r["id"] not in preferred_ids, r.get("last_test", 0), not r.get("stable", False), r["id"]))
     explore.sort(key=lambda r: (r.get("last_test", 0), -r.get("first_seen", 0), r["id"]))
     quota = min(len(explore), max(1, math.ceil(max_candidates * exploration_ratio)))
     if max_candidates == 1 and known:

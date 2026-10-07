@@ -1,6 +1,6 @@
 """mihomo 内核：下载、生成测试配置、测延迟、测纯净度。
 
-- 测延迟：external-controller 的 /proxies/{name}/delay（并发）
+- 测延迟：经每个节点的独立 mixed 监听发起真实请求，验证 TLS 和 HTTP 状态（并发）
 - 测纯净度：给每个节点开一个本地 mixed 监听端口，用 IN-NAME 规则把该端口的流量
   定向到对应节点，然后通过该端口请求 ippure，拿到真实出口 IP 与 fraudScore。
 """
@@ -330,8 +330,32 @@ def build_purity_config(proxies: list[dict], controller: str, secret: str,
 
 # ---------------------------------------------------------------- 测延迟
 
+def _connectivity_get(port: int, url: str, timeout_ms: int,
+                      expected_status: int | None) -> int | None:
+    """Use the node's listener so the result includes CONNECT, TLS and HTTP."""
+    proxy = f"http://127.0.0.1:{port}"
+    timeout = timeout_ms / 1000
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            session.proxies = {"http": proxy, "https": proxy}
+            started = time.monotonic()
+            # A fresh session for every round rechecks TLS instead of reusing
+            # a previously successful tunnel. Do not accept portal redirects.
+            with session.get(url, timeout=(timeout, timeout), verify=True,
+                             allow_redirects=False, stream=True) as response:
+                valid = (response.status_code == expected_status
+                         if expected_status is not None
+                         else 200 <= response.status_code < 300)
+                if valid:
+                    return max(1, round((time.monotonic() - started) * 1000))
+    except requests.RequestException:
+        pass
+    return None
+
+
 def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, list[int | None]]:
-    """轮换多个目标检测 HTTPS/返回码，None 表示该轮失败。"""
+    """通过每节点独立监听真实请求目标；None 表示该轮失败。"""
     cc = cfg["connectivity"]
     urls = [cc["test_url"]]
     if cc.get("verification_url"):
@@ -340,24 +364,39 @@ def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, li
     rounds = int(cc["rounds"])
     conc = int(cc["concurrency"])
     mc = cfg["mihomo"]
-    text = build_test_config(proxies, mc["controller"], mc["secret"])
     results: dict[str, list] = {p["name"]: [] for p in proxies}
     if not proxies:
         return results
-    with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])) as m:
-        for rnd in range(1, rounds + 1):
-            url = urls[(rnd - 1) % len(urls)]
-            ok = 0
-            with cf.ThreadPoolExecutor(max_workers=conc) as ex:
-                futs = {ex.submit(m.delay, p["name"], url, tmo, cc.get("expected_status")): p["name"]
-                        for p in proxies}
-                for fut in cf.as_completed(futs):
-                    name = futs[fut]
-                    d = fut.result()
-                    results[name].append(d)
-                    if d is not None:
-                        ok += 1
-            log.info("  连通性第 %d/%d 轮：%d/%d 通过", rnd, rounds, ok, len(proxies))
+    base_port = int(mc["base_listen_port"])
+    size = min(64, 65536 - base_port)
+    controller_port = int(mc["controller"].rsplit(":", 1)[1])
+    if base_port <= controller_port < base_port + min(size, len(proxies)):
+        raise ValueError("mihomo controller overlaps the connectivity listener ports")
+    for start in range(0, len(proxies), size):
+        batch = proxies[start:start + size]
+        # Never probe an unrelated local service if a listener is occupied.
+        for port in range(base_port, base_port + len(batch)):
+            with socket.socket() as check:
+                if os.name != "nt":
+                    check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                check.bind(("127.0.0.1", port))
+        text, port_map = build_purity_config(batch, mc["controller"], mc["secret"], base_port)
+        with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])):
+            with cf.ThreadPoolExecutor(max_workers=conc) as executor:
+                for rnd in range(1, rounds + 1):
+                    url = urls[(rnd - 1) % len(urls)]
+                    futures = {executor.submit(_connectivity_get, port_map[p["name"]], url,
+                                               tmo, cc.get("expected_status")): p["name"]
+                               for p in batch}
+                    ok = 0
+                    for future in cf.as_completed(futures):
+                        name = futures[future]
+                        delay = future.result()
+                        results[name].append(delay)
+                        if delay is not None:
+                            ok += 1
+                    log.info("  连通性批次 %d-%d，第 %d/%d 轮：%d/%d 通过",
+                             start + 1, start + len(batch), rnd, rounds, ok, len(batch))
     return results
 
 

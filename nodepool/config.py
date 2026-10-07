@@ -19,7 +19,8 @@ DEFAULTS = {
     "output": {"group_stable": "🛡️ 稳定节点", "max_test_age_hours": 12},
     "purity": {"batch_size": 16, "max_seconds": 420},
     "search": {"max_seconds": 420},
-    "publish": {"pool_filename": "stable-pool.json"},
+    "publish": {"pool_filename": "stable-pool.json", "candidate_filename": "candidates.yaml",
+                "client_health_filename": "client-health.json", "client_health_max_age_hours": 168},
 }
 
 
@@ -72,6 +73,7 @@ def validate_config(cfg: dict) -> None:
     number("purity", "max_score", 0, 100, integer=True)
     number("purity", "stagger", 0)
     number("search", "page_delay", 0)
+    number("publish", "client_health_max_age_hours", 0.001)
     number("pool", "stable_min_rate", 0.001, 1)
     number("pool", "exploration_ratio", 0.001, 0.999)
     number("mihomo", "base_listen_port", 1024, 65535, integer=True)
@@ -108,13 +110,16 @@ def validate_config(cfg: dict) -> None:
                          ("output", "group_select"), ("output", "group_stable"),
                          ("publish", "gist_filename"), ("publish", "gist_description"),
                          ("publish", "pool_filename"),
+                         ("publish", "candidate_filename"), ("publish", "client_health_filename"),
                          ("mihomo", "secret")):
         if not isinstance(cfg[section].get(key), str) or not cfg[section][key].strip():
             raise ValueError(f"{section}.{key} 不能为空")
     if type(cfg["publish"].get("enabled")) is not bool:
         raise ValueError("publish.enabled 必须为布尔值")
-    if cfg["publish"]["pool_filename"] == cfg["publish"]["gist_filename"]:
-        raise ValueError("稳定池备份文件名不能与订阅文件相同")
+    filenames = [cfg["publish"][key] for key in
+                 ("gist_filename", "pool_filename", "candidate_filename", "client_health_filename")]
+    if len(set(filenames)) != len(filenames):
+        raise ValueError("订阅、候选、稳定池和客户端检测文件名不能相同")
     tiers = cfg["purity"].get("tiers")
     if not isinstance(tiers, list) or not tiers:
         raise ValueError("purity.tiers 不能为空")

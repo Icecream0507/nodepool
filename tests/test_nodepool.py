@@ -272,6 +272,7 @@ class MainTests(unittest.TestCase):
         self.stack.enter_context(patch.object(update, "ROOT", self.root))
         self.stack.enter_context(patch.object(update, "make_session", return_value=Mock()))
         self.stack.enter_context(patch.object(publish, "load_token", return_value="test"))
+        self.stack.enter_context(patch.object(publish, "restore_client_health", return_value=None))
         self.stack.enter_context(patch.object(mihomo, "ensure_binary", return_value=Path("unused")))
         self.stack.enter_context(patch.object(mihomo, "prune_invalid", side_effect=lambda exe, ps, *args: ps))
         self.stack.enter_context(patch.object(mihomo, "test_connectivity", side_effect=lambda exe, ps, cfg: {p["name"]: [10, 20, 30, 40] for p in ps}))
