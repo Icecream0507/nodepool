@@ -63,6 +63,7 @@ def _selection_layout(document: dict, cfg: dict) -> dict:
         raise ValueError("节点名称重复")
     group = {"name": group_auto, "type": "url-test", "proxies": names,
              "url": cfg["connectivity"]["test_url"], "interval": 180,
+             "timeout": cfg["connectivity"]["timeout_ms"],
              "tolerance": 50, "lazy": False}
     if cfg["connectivity"].get("expected_status") is not None:
         group["expected-status"] = cfg["connectivity"]["expected_status"]

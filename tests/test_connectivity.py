@@ -66,7 +66,7 @@ class ConnectivityConfigTests(unittest.TestCase):
     def test_two_targets_cannot_pass_if_only_one_is_reachable(self):
         for rounds, min_pass in ((4, 2), (3, 2), (1, 1)):
             cfg = copy.deepcopy(self.cfg)
-            cfg["connectivity"]["verification_url"] = DEFAULT_VERIFICATION_URL
+            cfg["connectivity"].update(test_url=DEFAULT_TEST_URL, verification_url=DEFAULT_VERIFICATION_URL)
             cfg["connectivity"].update(rounds=rounds, min_pass=min_pass)
             with self.subTest(rounds=rounds), self.assertRaises(ValueError):
                 validate_config(cfg)
@@ -84,7 +84,7 @@ class ConnectivityConfigTests(unittest.TestCase):
         for key, value in (("expected_status", True), ("expected_status", 99),
                            ("expected_status", 600), ("expected_status", 204.5),
                            ("verification_url", []), ("verification_url", "ftp://example.test/"),
-                           ("verification_url", DEFAULT_TEST_URL), ("timeout_ms", 32768)):
+                           ("verification_url", self.cfg["connectivity"]["test_url"]), ("timeout_ms", 32768)):
             cfg = copy.deepcopy(self.cfg)
             cfg["connectivity"][key] = value
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
@@ -167,7 +167,7 @@ class PinnedCoreTests(unittest.TestCase):
 class ConnectivityRoundTests(unittest.TestCase):
     def test_optional_second_target_uses_native_api_and_rejects_partial_reachability(self):
         cfg = load_config(ROOT / "config.yaml")
-        cfg["connectivity"]["verification_url"] = DEFAULT_VERIFICATION_URL
+        cfg["connectivity"].update(test_url=DEFAULT_TEST_URL, verification_url=DEFAULT_VERIFICATION_URL)
         api = Mock()
         api.delay.side_effect = lambda name, url, timeout, status: 20 if name == "both" or url == DEFAULT_TEST_URL else None
         with patch.object(mihomo, "Mihomo") as process:
@@ -175,7 +175,7 @@ class ConnectivityRoundTests(unittest.TestCase):
             results = mihomo.test_connectivity(Path("unused"), [{"name": "one"}, {"name": "both"}], cfg)
         self.assertEqual(results["one"], [20, None, 20, None])
         self.assertEqual(results["both"], [20] * 4)
-        self.assertTrue(all(call.args[2:] == (5000, 204) for call in api.delay.call_args_list))
+        self.assertTrue(all(call.args[2:] == (10000, 204) for call in api.delay.call_args_list))
 
     def test_default_repeats_same_native_clash_delay_test_four_times(self):
         cfg = load_config(ROOT / "config.yaml")
@@ -186,7 +186,8 @@ class ConnectivityRoundTests(unittest.TestCase):
             result = mihomo.test_connectivity(Path("unused"), [{"name": "one"}], cfg)
         self.assertEqual(result["one"], [20, None, 30, 25])
         self.assertEqual(api.delay.call_count, 4)
-        self.assertTrue(all(call.args == ("one", DEFAULT_TEST_URL, 5000, 204) for call in api.delay.call_args_list))
+        self.assertTrue(all(call.args == ("one", "https://cp.cloudflare.com/generate_204", 10000, 204)
+                            for call in api.delay.call_args_list))
 
     def test_bounded_batches_share_subscription_dns_and_have_no_probe_listeners(self):
         from nodepool.output import build_dns_config
@@ -205,6 +206,7 @@ class ConnectivityRoundTests(unittest.TestCase):
             self.assertTrue(config["unified-delay"])
             self.assertTrue(config["ipv6"])
             auto = config["proxy-groups"][1]
+            self.assertEqual(auto["timeout"], 10000)
             self.assertEqual(auto["interval"], 0)
             self.assertTrue(auto["lazy"])
 

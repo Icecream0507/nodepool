@@ -63,7 +63,8 @@ Linux 下载到 `bin/mihomo`。`mihomo.version` 固定为本机 Clash Verge 的 
 - 固定 Gist 不存在、不可访问或是 public gist 时停止发布，不自动换地址。
 - 采集与纯净度检测均有软时间预算，未完成的节点留待后续运行。
 - 默认调用 mihomo 原生 `/proxies/{name}/delay`，与 Clash 点击延迟测试使用同一个 URLTest 实现。
-  使用同版本内核、订阅 DNS、`unified-delay` 和 Google HTTPS 测速地址，4 轮至少通过 3 轮。
+  使用同版本内核、订阅 DNS、`unified-delay`，与 Clash Verge 手动测速默认一致的
+  Cloudflare HTTPS 地址和 10 秒超时，4 轮至少通过 3 轮。
   除了正延迟，还核对该地址的 `alive` 和最近历史记录，拒绝 HTTP 状态不符合 204 的假通过。
   可选 `verification_url` 可以增加第二个测试目标；默认关闭以保持与客户端点击测速一致。
 - 检测目标、状态码或门槛变化后，旧结果保留为历史，复测符合当前策略后才重新输出或晋升。

@@ -15,10 +15,10 @@ collect:
   max_candidates: 600    # 单次测试的候选节点上限（去重后，含历史池；越大越慢但找到越多）
 
 connectivity:
-  test_url: "https://www.gstatic.com/generate_204"
+  test_url: "https://cp.cloudflare.com/generate_204" # Clash Verge 手动延迟测试默认地址
   verification_url: null # 与 Clash 点击延迟测试一致，重复检测同一地址
   expected_status: 204   # 严格检查响应状态，拒绝劫持页/错误页假通过
-  timeout_ms: 5000
+  timeout_ms: 10000       # Clash Verge 手动延迟测试默认超时 10 秒
   rounds: 4              # 测几轮延迟
   min_pass: 3            # 至少成功几轮才算可用（4 过 3：淘汰一测就抖的）
   concurrency: 32
