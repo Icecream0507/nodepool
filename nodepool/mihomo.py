@@ -1,6 +1,6 @@
 """mihomo 内核：下载、生成测试配置、测延迟、测纯净度。
 
-- 测延迟：经每个节点的独立 mixed 监听发起真实请求，验证 TLS 和 HTTP 状态（并发）
+- 测延迟：调用 mihomo 原生 URLTest，与 Clash 点击延迟测试使用同一接口
 - 测纯净度：给每个节点开一个本地 mixed 监听端口，用 IN-NAME 规则把该端口的流量
   定向到对应节点，然后通过该端口请求 ippure，拿到真实出口 IP 与 fraudScore。
 """
@@ -41,14 +41,23 @@ def _arch() -> str:
     return m
 
 
-def ensure_binary(root: Path, session: requests.Session) -> Path:
+def ensure_binary(root: Path, session: requests.Session, version: str | None = None) -> Path:
     system = platform.system().lower()
     target = root / "bin" / ("mihomo.exe" if system == "windows" else "mihomo")
     if target.exists() and target.stat().st_size > 1_000_000:
-        return target
+        if version is None:
+            return target
+        try:
+            current = subprocess.run([str(target), "-v"], check=True, capture_output=True, timeout=10,
+                                     creationflags=subprocess.CREATE_NO_WINDOW if system == "windows" else 0)
+            if re.search(r"\b" + re.escape(version) + r"\b", current.stdout.decode("utf-8", "replace")):
+                return target
+        except (OSError, subprocess.SubprocessError):
+            pass
     target.parent.mkdir(parents=True, exist_ok=True)
     log.info("未找到 mihomo 内核，开始下载…（%s/%s）", system, _arch())
-    r = get_with_retry(session, RELEASE_API, tries=3, timeout=30,
+    release_api = RELEASE_API if version is None else RELEASE_API.rsplit("/", 1)[0] + "/tags/" + version
+    r = get_with_retry(session, release_api, tries=3, timeout=30,
                         headers={"Accept": "application/vnd.github+json"})
     if r is None or r.status_code != 200:
         raise RuntimeError(f"获取 mihomo release 失败：{getattr(r,'status_code','ERR')}")
@@ -92,7 +101,10 @@ def ensure_binary(root: Path, session: requests.Session) -> Path:
             dst.write(binary)
         if system != "windows":
             os.chmod(tmp, 0o755)
-        subprocess.run([tmp, "-v"], check=True, capture_output=True, timeout=10)
+        check = subprocess.run([tmp, "-v"], check=True, capture_output=True, timeout=10,
+                               creationflags=subprocess.CREATE_NO_WINDOW if system == "windows" else 0)
+        if version and not re.search(r"\b" + re.escape(version) + r"\b", check.stdout.decode("utf-8", "replace")):
+            raise RuntimeError("下载的 mihomo 内核与指定版本不符")
         os.replace(tmp, target)
     finally:
         if os.path.exists(tmp):
@@ -288,7 +300,8 @@ def validate_subscription(exe: Path, text: str, timeout: int = 20) -> None:
     check_config(exe, dump_yaml(config), timeout)
 
 
-def build_test_config(proxies: list[dict], controller: str, secret: str) -> str:
+def build_test_config(proxies: list[dict], controller: str, secret: str,
+                      client_cfg: dict | None = None) -> str:
     cfg = dict(_BASE_CFG)
     cfg["external-controller"] = controller
     cfg["secret"] = secret
@@ -296,6 +309,16 @@ def build_test_config(proxies: list[dict], controller: str, secret: str) -> str:
     cfg["proxy-groups"] = [{"name": "GLOBAL", "type": "select",
                              "proxies": ["DIRECT"] + [p["name"] for p in proxies]}]
     cfg["rules"] = ["MATCH,DIRECT"]
+    if client_cfg is not None and proxies:
+        from .output import simplify_subscription
+        cfg = yaml.safe_load(simplify_subscription(dump_yaml(cfg), client_cfg))
+        cfg["ipv6"] = True  # Match Clash Verge; subscription DNS still disables IPv6 answers.
+        cfg["rules"] = [rule for rule in cfg["rules"] if not rule.startswith(("GEOIP,", "GEOSITE,"))]
+        # Explicit API calls own the evidence; background tests must not
+        # overwrite the state between reading the delay and its status.
+        for group in cfg["proxy-groups"]:
+            if group["type"] == "url-test":
+                group.update(interval=0, lazy=True)
     return dump_yaml(cfg)
 
 
@@ -330,32 +353,8 @@ def build_purity_config(proxies: list[dict], controller: str, secret: str,
 
 # ---------------------------------------------------------------- 测延迟
 
-def _connectivity_get(port: int, url: str, timeout_ms: int,
-                      expected_status: int | None) -> int | None:
-    """Use the node's listener so the result includes CONNECT, TLS and HTTP."""
-    proxy = f"http://127.0.0.1:{port}"
-    timeout = timeout_ms / 1000
-    try:
-        with requests.Session() as session:
-            session.trust_env = False
-            session.proxies = {"http": proxy, "https": proxy}
-            started = time.monotonic()
-            # A fresh session for every round rechecks TLS instead of reusing
-            # a previously successful tunnel. Do not accept portal redirects.
-            with session.get(url, timeout=(timeout, timeout), verify=True,
-                             allow_redirects=False, stream=True) as response:
-                valid = (response.status_code == expected_status
-                         if expected_status is not None
-                         else 200 <= response.status_code < 300)
-                if valid:
-                    return max(1, round((time.monotonic() - started) * 1000))
-    except requests.RequestException:
-        pass
-    return None
-
-
 def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, list[int | None]]:
-    """通过每节点独立监听真实请求目标；None 表示该轮失败。"""
+    """Repeat Clash's native per-proxy delay test; None means that round failed."""
     cc = cfg["connectivity"]
     urls = [cc["test_url"]]
     if cc.get("verification_url"):
@@ -367,25 +366,15 @@ def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, li
     results: dict[str, list] = {p["name"]: [] for p in proxies}
     if not proxies:
         return results
-    base_port = int(mc["base_listen_port"])
-    size = min(64, 65536 - base_port)
-    controller_port = int(mc["controller"].rsplit(":", 1)[1])
-    if base_port <= controller_port < base_port + min(size, len(proxies)):
-        raise ValueError("mihomo controller overlaps the connectivity listener ports")
+    size = 64
     for start in range(0, len(proxies), size):
         batch = proxies[start:start + size]
-        # Never probe an unrelated local service if a listener is occupied.
-        for port in range(base_port, base_port + len(batch)):
-            with socket.socket() as check:
-                if os.name != "nt":
-                    check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                check.bind(("127.0.0.1", port))
-        text, port_map = build_purity_config(batch, mc["controller"], mc["secret"], base_port)
-        with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])):
+        text = build_test_config(batch, mc["controller"], mc["secret"], cfg)
+        with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])) as core:
             with cf.ThreadPoolExecutor(max_workers=conc) as executor:
                 for rnd in range(1, rounds + 1):
                     url = urls[(rnd - 1) % len(urls)]
-                    futures = {executor.submit(_connectivity_get, port_map[p["name"]], url,
+                    futures = {executor.submit(core.delay, p["name"], url,
                                                tmo, cc.get("expected_status")): p["name"]
                                for p in batch}
                     ok = 0

@@ -12,8 +12,8 @@ from .util import atomic_write, log, node_id, node_key
 
 def connectivity_policy(cfg: dict) -> str:
     """Identify the evidence required for publication without deleting old tests."""
-    policy = {"schema": 3, "probe": "verified-http-get", **{key: cfg.get(key) for key in (
-        "test_url", "verification_url", "timeout_ms", "rounds", "min_pass")},
+    policy = {"schema": 4, "probe": "mihomo-native-url-test", **{key: cfg.get(key) for key in (
+        "test_url", "verification_url", "timeout_ms", "rounds", "min_pass", "core_version")},
         "expected_status": cfg.get("expected_status", 204)}
     encoded = json.dumps(policy, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]

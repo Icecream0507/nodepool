@@ -97,7 +97,7 @@ def main() -> int:
                 source = publish.read_remote_file(ROOT, session, token, cfg, cfg["publish"]["gist_filename"])
             if source is None:
                 raise RuntimeError("远端没有候选或订阅文件")
-        exe = args.core.resolve() if args.core else mihomo.ensure_binary(ROOT, session)
+        exe = args.core.resolve() if args.core else mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"])
         filtered, report = verify_document(source, exe, cfg)
         atomic_write(ROOT / "data" / "local-verification.json", json.dumps(report, ensure_ascii=False, indent=2))
         if filtered is None:

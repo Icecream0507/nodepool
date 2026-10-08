@@ -57,7 +57,10 @@ def _run(cfg, args) -> int:
     test_policy = pool.connectivity_policy(cfg["connectivity"])
     try:
         report_path = ROOT / "data" / "client-health.json"
-        if token:
+        report = None
+        if not cfg["publish"]["client_health_required"]:
+            log.info("发布依据云端原生延迟测试与稳定性记录；不要求本机白名单")
+        elif token:
             report = publish.restore_client_health(ROOT, session, token, cfg)
             if report is not None:
                 client_health.save_report(report_path, report)
@@ -101,7 +104,7 @@ def _run(cfg, args) -> int:
         cands = pool.select_candidates(pl, cfg["collect"]["max_candidates"],
                                        pc["exploration_ratio"], score_limit, **selection_args)
         alive_ids = set()
-        exe = mihomo.ensure_binary(ROOT, session) if cands else None
+        exe = mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"]) if cands else None
         if cands:
             mc = cfg["mihomo"]
             test_proxies = [{**r["proxy"], "name": r["id"]} for r in cands]
@@ -150,7 +153,7 @@ def _run(cfg, args) -> int:
             return 4
         candidate_text, _ = output.build_subscription(final, cfg)
         if exe is None:
-            exe = mihomo.ensure_binary(ROOT, session)
+            exe = mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"])
         mihomo.validate_subscription(exe, candidate_text, cfg["mihomo"]["startup_timeout"])
         atomic_write(ROOT / "output" / "candidates.yaml", candidate_text)
         cloud_total = len(final)
@@ -170,7 +173,7 @@ def _run(cfg, args) -> int:
         if not stats["total"]:
             raise RuntimeError("订阅没有可输出的节点")
         if exe is None:
-            exe = mihomo.ensure_binary(ROOT, session)
+            exe = mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"])
         mihomo.validate_subscription(exe, sub_text, cfg["mihomo"]["startup_timeout"])
         out_path = ROOT / cfg["output"]["file"]
         atomic_write(out_path, sub_text)

@@ -41,10 +41,10 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: bin
-          key: ${{ runner.os }}-${{ runner.arch }}-mihomo-${{ hashFiles('nodepool/mihomo.py') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-mihomo-${{ hashFiles('nodepool/mihomo.py', 'config.yaml') }}
 
       - name: Prepare mihomo for native validation
-        run: python -c "from pathlib import Path; from nodepool.mihomo import ensure_binary; from nodepool.util import make_session; ensure_binary(Path('.'), make_session(None))"
+        run: python -c "from pathlib import Path; from nodepool.config import load_config; from nodepool.mihomo import ensure_binary; from nodepool.util import make_session; ensure_binary(Path('.'), make_session(None), load_config(Path('config.yaml'))['mihomo']['version'])"
 
       - name: Validate logic and native core
         run: python -m unittest discover -s tests -v

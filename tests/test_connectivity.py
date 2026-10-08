@@ -66,8 +66,18 @@ class ConnectivityConfigTests(unittest.TestCase):
     def test_two_targets_cannot_pass_if_only_one_is_reachable(self):
         for rounds, min_pass in ((4, 2), (3, 2), (1, 1)):
             cfg = copy.deepcopy(self.cfg)
+            cfg["connectivity"]["verification_url"] = DEFAULT_VERIFICATION_URL
             cfg["connectivity"].update(rounds=rounds, min_pass=min_pass)
             with self.subTest(rounds=rounds), self.assertRaises(ValueError):
+                validate_config(cfg)
+
+    def test_cloud_gate_and_pinned_version_require_explicit_valid_values(self):
+        for section, key, value in (("publish", "client_health_required", "false"),
+                                    ("mihomo", "version", "latest"),
+                                    ("mihomo", "version", "v1.19.11/other")):
+            cfg = copy.deepcopy(self.cfg)
+            cfg[section][key] = value
+            with self.subTest(section=section, value=value), self.assertRaises(ValueError):
                 validate_config(cfg)
 
     def test_invalid_status_url_or_api_timeout_is_rejected(self):
@@ -126,100 +136,83 @@ class DelayApiTests(unittest.TestCase):
                 self.assertIsNone(api.delay("a", DEFAULT_TEST_URL, 5000, 204))
 
 
+class PinnedCoreTests(unittest.TestCase):
+    def cached_core(self, root):
+        path = root / "bin" / ("mihomo.exe" if sys.platform == "win32" else "mihomo")
+        path.parent.mkdir()
+        path.write_bytes(b"x" * 1_000_001)
+        return path
+
+    def test_matching_cached_core_is_reused_without_download(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = self.cached_core(root)
+            with patch.object(mihomo.subprocess, "run", return_value=Mock(stdout=b"Mihomo Meta v1.19.11 windows amd64")), \
+                    patch.object(mihomo, "get_with_retry") as download:
+                self.assertEqual(mihomo.ensure_binary(root, Mock(), "v1.19.11"), path)
+                download.assert_not_called()
+
+    def test_mismatched_cache_requires_pinned_release_and_survives_download_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = self.cached_core(root)
+            with patch.object(mihomo.subprocess, "run", return_value=Mock(stdout=b"Mihomo Meta v1.19.32 linux amd64")), \
+                    patch.object(mihomo, "get_with_retry", return_value=Mock(status_code=404)) as download, \
+                    self.assertRaises(RuntimeError):
+                mihomo.ensure_binary(root, Mock(), "v1.19.11")
+            self.assertEqual(download.call_args.args[1], "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/v1.19.11")
+            self.assertEqual(path.stat().st_size, 1_000_001)
+
+
 class ConnectivityRoundTests(unittest.TestCase):
-    def test_default_rounds_reject_a_node_that_only_reaches_one_target(self):
+    def test_optional_second_target_uses_native_api_and_rejects_partial_reachability(self):
         cfg = load_config(ROOT / "config.yaml")
-        calls = []
-
-        def request(port, url, timeout_ms, expected_status):
-            name = "one" if port == cfg["mihomo"]["base_listen_port"] else "both"
-            calls.append((name, url, expected_status))
-            return 20 if name == "both" or url == cfg["connectivity"]["test_url"] else None
-
+        cfg["connectivity"]["verification_url"] = DEFAULT_VERIFICATION_URL
         api = Mock()
-        api.delay.side_effect = AssertionError("the delay API is not an HTTP proof")
-        with patch.object(mihomo, "Mihomo") as process, \
-                patch.object(mihomo, "_connectivity_get", side_effect=request), \
-                patch.object(mihomo.socket, "socket"):
+        api.delay.side_effect = lambda name, url, timeout, status: 20 if name == "both" or url == DEFAULT_TEST_URL else None
+        with patch.object(mihomo, "Mihomo") as process:
             process.return_value.__enter__.return_value = api
             results = mihomo.test_connectivity(Path("unused"), [{"name": "one"}, {"name": "both"}], cfg)
         self.assertEqual(results["one"], [20, None, 20, None])
-        self.assertEqual(results["both"], [20, 20, 20, 20])
-        self.assertLess(sum(d is not None for d in results["one"]), cfg["connectivity"]["min_pass"])
-        self.assertEqual([url for name, url, status in calls if name == "both"],
-                         [DEFAULT_TEST_URL, DEFAULT_VERIFICATION_URL] * 2)
-        self.assertTrue(all(status == 204 for name, url, status in calls))
+        self.assertEqual(results["both"], [20] * 4)
+        self.assertTrue(all(call.args[2:] == (5000, 204) for call in api.delay.call_args_list))
 
-    def test_candidates_are_split_into_bounded_independent_listener_batches(self):
+    def test_default_repeats_same_native_clash_delay_test_four_times(self):
+        cfg = load_config(ROOT / "config.yaml")
+        api = Mock()
+        api.delay.side_effect = [20, None, 30, 25]
+        with patch.object(mihomo, "Mihomo") as process:
+            process.return_value.__enter__.return_value = api
+            result = mihomo.test_connectivity(Path("unused"), [{"name": "one"}], cfg)
+        self.assertEqual(result["one"], [20, None, 30, 25])
+        self.assertEqual(api.delay.call_count, 4)
+        self.assertTrue(all(call.args == ("one", DEFAULT_TEST_URL, 5000, 204) for call in api.delay.call_args_list))
+
+    def test_bounded_batches_share_subscription_dns_and_have_no_probe_listeners(self):
+        from nodepool.output import build_dns_config
         cfg = load_config(ROOT / "config.yaml")
         proxies = [{"name": f"node-{n}"} for n in range(65)]
-        with patch.object(mihomo, "Mihomo") as process, \
-                patch.object(mihomo, "_connectivity_get", return_value=10), \
-                patch.object(mihomo.socket, "socket"):
+        with patch.object(mihomo, "Mihomo") as process:
+            process.return_value.__enter__.return_value.delay.return_value = 10
             result = mihomo.test_connectivity(Path("unused"), proxies, cfg)
         self.assertEqual(len(result), 65)
         self.assertTrue(all(value == [10] * 4 for value in result.values()))
         configs = [yaml.safe_load(call.args[1]) for call in process.call_args_list]
-        self.assertEqual([len(c["listeners"]) for c in configs], [64, 1])
-        self.assertEqual(configs[0]["rules"][0], "IN-NAME,in-0,node-0")
-        self.assertEqual(configs[0]["rules"][63], "IN-NAME,in-63,node-63")
-        self.assertEqual(configs[1]["rules"][0], "IN-NAME,in-0,node-64")
+        self.assertEqual([len(c["proxies"]) for c in configs], [64, 1])
+        for config in configs:
+            self.assertNotIn("listeners", config)
+            self.assertEqual(config["dns"], build_dns_config(cfg["output"]["group_select"]))
+            self.assertTrue(config["unified-delay"])
+            self.assertTrue(config["ipv6"])
+            auto = config["proxy-groups"][1]
+            self.assertEqual(auto["interval"], 0)
+            self.assertTrue(auto["lazy"])
 
-    def test_occupied_listener_port_fails_before_starting_core(self):
+    def test_changed_core_version_invalidates_previous_connectivity_evidence(self):
+        from nodepool.pool import connectivity_policy
         cfg = load_config(ROOT / "config.yaml")
-        with socket.socket() as occupied:
-            occupied.bind(("127.0.0.1", 0))
-            occupied.listen()
-            cfg["mihomo"]["base_listen_port"] = occupied.getsockname()[1]
-            with patch.object(mihomo, "Mihomo") as process, self.assertRaises(OSError):
-                mihomo.test_connectivity(Path("unused"), [{"name": "a"}], cfg)
-            process.assert_not_called()
-
-    def test_controller_cannot_share_a_connectivity_listener_port(self):
-        cfg = load_config(ROOT / "config.yaml")
-        cfg["mihomo"]["controller"] = f"127.0.0.1:{cfg['mihomo']['base_listen_port']}"
-        with patch.object(mihomo, "Mihomo") as process, self.assertRaises(ValueError):
-            mihomo.test_connectivity(Path("unused"), [{"name": "a"}], cfg)
-        process.assert_not_called()
-
-
-class RealRequestTests(unittest.TestCase):
-    def make_session(self, status=204):
-        factory = patch.object(mihomo.requests, "Session")
-        self.addCleanup(factory.stop)
-        session = factory.start().return_value.__enter__.return_value
-        response = session.get.return_value.__enter__.return_value
-        response.status_code = status
-        return session
-
-    def test_https_checks_certificates_uses_only_node_proxy_and_measures_handshake(self):
-        session = self.make_session()
-        with patch.object(mihomo.time, "monotonic", side_effect=[10, 10.123]):
-            self.assertEqual(mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 5000, 204), 123)
-        self.assertFalse(session.trust_env)
-        self.assertEqual(session.proxies, {"http": "http://127.0.0.1:23456",
-                                           "https": "http://127.0.0.1:23456"})
-        session.get.assert_called_once_with(DEFAULT_TEST_URL, timeout=(5, 5),
-                                            verify=True, allow_redirects=False, stream=True)
-
-    def test_fake_success_redirect_and_tls_failures_cannot_pass(self):
-        session = self.make_session()
-        for status in (200, 301, 302, 403, 500):
-            session.get.return_value.__enter__.return_value.status_code = status
-            with self.subTest(status=status):
-                self.assertIsNone(mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 1000, 204))
-        for error in (requests.exceptions.SSLError(), requests.Timeout(), requests.exceptions.ProxyError()):
-            session.get.side_effect = error
-            with self.subTest(error=type(error).__name__):
-                self.assertIsNone(mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 1000, 204))
-
-    def test_custom_unspecified_status_accepts_only_success_and_never_redirects(self):
-        session = self.make_session()
-        for status, expected in ((200, True), (204, True), (302, False), (503, False)):
-            session.get.return_value.__enter__.return_value.status_code = status
-            with self.subTest(status=status):
-                actual = mihomo._connectivity_get(23456, DEFAULT_TEST_URL, 1000, None)
-                self.assertEqual(actual is not None, expected)
+        current = cfg["connectivity"]
+        self.assertNotEqual(connectivity_policy(current), connectivity_policy({**current, "core_version": "v1.19.32"}))
 
 
 @unittest.skipUnless(EXE.exists(), "mihomo binary is not installed")
@@ -242,11 +235,12 @@ class NativeStatusTests(unittest.TestCase):
             response.raise_for_status()
             self.assertTrue(set(names).issubset(response.json()["proxies"]))
 
-    def test_real_listeners_isolate_nodes_and_reject_error_pages_and_redirects(self):
+    def test_native_api_routes_each_node_and_rejects_error_pages_and_redirects(self):
         auth_headers = []
         class Target(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.server.paths.append(self.path)
+                self.server.methods.append(self.command)
                 time.sleep(0.02)
                 status = 302 if self.path == "/redirect" else self.server.status
                 self.send_response(status)
@@ -254,6 +248,8 @@ class NativeStatusTests(unittest.TestCase):
                     self.send_header("Location", "/204")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            do_HEAD = do_GET
 
             def log_message(self, *args):
                 pass
@@ -290,7 +286,7 @@ class NativeStatusTests(unittest.TestCase):
             good_name, bad_name = "0089885980956613", "1e3"
             for name, status in ((good_name, 204), (bad_name, 200)):
                 target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
-                target.paths, target.status = [], status
+                target.paths, target.methods, target.status = [], [], status
                 upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
                 upstream.target = ("127.0.0.1", target.server_port)
                 for server in (target, upstream):
@@ -335,8 +331,12 @@ class NativeStatusTests(unittest.TestCase):
                 cfg["connectivity"]["test_url"] = "http://health.invalid/redirect"
                 redirects = mihomo.test_connectivity(EXE, proxies[:1], cfg)
                 self.assertEqual(redirects[good_name], [None, None])
-            self.assertEqual(servers[0].paths, ["/204", "/204", "/redirect", "/redirect"])
-            self.assertEqual(servers[1].paths, ["/204", "/204"])
+            self.assertGreaterEqual(servers[0].paths.count("/204"), 2)
+            self.assertGreaterEqual(servers[0].paths.count("/redirect"), 2)
+            self.assertEqual(set(servers[0].paths), {"/204", "/redirect"})
+            self.assertGreaterEqual(servers[1].paths.count("/204"), 2)
+            self.assertEqual(set(servers[1].paths), {"/204"})
+            self.assertEqual(set(servers[0].methods + servers[1].methods), {"HEAD"})
             expected_auth = "Basic " + base64.b64encode(b"00089:0089885980956613").decode("ascii")
             self.assertGreaterEqual(len(auth_headers), 6)
             self.assertTrue(all(header == expected_auth for header in auth_headers))

@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def config():
-    return load_config(ROOT / "config.yaml")
+    cfg = load_config(ROOT / "config.yaml")
+    cfg["publish"]["client_health_required"] = True
+    return cfg
 
 
 def proxy(name, server):
@@ -83,6 +85,17 @@ class CloudClientGateTests(unittest.TestCase):
         self.assertEqual([p["server"] for p in final["proxies"]], ["1.1.1.1"])
         self.assertEqual(len(yaml.safe_load(args.kwargs["candidates"])["proxies"]), 3)
         self.assertEqual(len(pool.load(self.root / "data/pool.json")), 3)
+
+    def test_cloud_mode_publishes_passed_nodes_without_reading_local_whitelist(self):
+        self.cfg["publish"]["client_health_required"] = False
+        self.restore.side_effect = RuntimeError("an old report must not block cloud publication")
+        health_path = self.root / "data/client-health.json"
+        health_path.write_text("expired or corrupt diagnostic report", encoding="utf-8")
+        self.assertEqual(self.run_update(), 0)
+        self.restore.assert_not_called()
+        final = yaml.safe_load(self.publisher.call_args.args[3])
+        self.assertEqual({p["server"] for p in final["proxies"]}, {p["server"] for p in PROXIES})
+        self.assertEqual(health_path.read_text(encoding="utf-8"), "expired or corrupt diagnostic report")
 
     def test_expired_report_only_updates_candidates_and_preserves_subscription(self):
         self.restore.return_value = report(self.cfg, age=169 * 3600)
@@ -156,6 +169,18 @@ class PublishingClientGateTests(unittest.TestCase):
         final = yaml.safe_load(payload["files"][self.cfg["publish"]["gist_filename"]]["content"])
         self.assertEqual([p["server"] for p in final["proxies"]], ["8.8.8.8"])
         self.assertEqual(len(yaml.safe_load(payload["files"][self.cfg["publish"]["candidate_filename"]]["content"])["proxies"]), 3)
+
+    def test_cloud_publication_ignores_old_required_failed_expired_and_corrupt_reports(self):
+        self.cfg["publish"]["client_health_required"] = False
+        for stored in (None, "broken", json.dumps(report(self.cfg, accepted=())),
+                       json.dumps(report(self.cfg, age=169 * 3600))):
+            with self.subTest(stored=stored):
+                self.request.reset_mock()
+                self.configure(stored)
+                self.assertIsNotNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg, candidates=self.content))
+                files = self.request.call_args.args[4]["files"]
+                self.assertEqual(len(yaml.safe_load(files[self.cfg["publish"]["gist_filename"]]["content"])["proxies"]), 3)
+                self.assertNotIn(self.cfg["publish"]["client_health_filename"], files)
 
     def test_bad_expired_or_wrong_policy_report_never_patches_subscription(self):
         wrong = report(self.cfg); wrong["policy"] = "old-policy"

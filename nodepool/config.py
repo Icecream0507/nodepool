@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,8 +21,10 @@ DEFAULTS = {
                "max_test_age_hours": 12, "group_other": "其他节点"},
     "purity": {"batch_size": 16, "max_seconds": 420, "enabled": True, "required": True},
     "search": {"max_seconds": 420},
+    "mihomo": {"version": None},
     "publish": {"pool_filename": "stable-pool.json", "candidate_filename": "candidates.yaml",
-                "client_health_filename": "client-health.json", "client_health_max_age_hours": 168},
+                "client_health_filename": "client-health.json", "client_health_max_age_hours": 168,
+                "client_health_required": False},
 }
 
 
@@ -40,6 +43,7 @@ def load_config(path: Path) -> dict:
     # Upgrade the old built-in probe, while preserving a user's custom URL and
     # its previous status-code behavior unless they explicitly opt in.
     connectivity = cfg["connectivity"]
+    connectivity["core_version"] = cfg["mihomo"]["version"]
     if connectivity.get("test_url") in (LEGACY_TEST_URL, DEFAULT_TEST_URL):
         connectivity["test_url"] = DEFAULT_TEST_URL
         connectivity.setdefault("verification_url", DEFAULT_VERIFICATION_URL)
@@ -122,6 +126,11 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(f"{section}.{key} 不能为空")
     if type(cfg["publish"].get("enabled")) is not bool:
         raise ValueError("publish.enabled 必须为布尔值")
+    if type(cfg["publish"].get("client_health_required")) is not bool:
+        raise ValueError("publish.client_health_required 必须为布尔值")
+    version = cfg["mihomo"].get("version")
+    if version is not None and (not isinstance(version, str) or re.fullmatch(r"v\d+\.\d+\.\d+", version) is None):
+        raise ValueError("mihomo.version 必须为 v主版本.次版本.修订号 或 null")
     filenames = [cfg["publish"][key] for key in
                  ("gist_filename", "pool_filename", "candidate_filename", "client_health_filename")]
     if len(set(filenames)) != len(filenames):

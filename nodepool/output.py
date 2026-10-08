@@ -27,6 +27,7 @@ def build_dns_config(group_select: str) -> dict:
         "enable": True,
         "enhanced-mode": "fake-ip",
         "ipv6": False,
+        "use-system-hosts": False,
         "default-nameserver": ["223.5.5.5", "119.29.29.29"],
         "proxy-server-nameserver": list(domestic),
         "direct-nameserver": list(domestic),

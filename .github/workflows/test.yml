@@ -17,4 +17,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -r requirements.txt
+      - name: Prepare configured mihomo core
+        run: python -c "from pathlib import Path; from nodepool.config import load_config; from nodepool.mihomo import ensure_binary; from nodepool.util import make_session; ensure_binary(Path('.'), make_session(None), load_config(Path('config.yaml'))['mihomo']['version'])"
       - run: python -m unittest discover -s tests -v
