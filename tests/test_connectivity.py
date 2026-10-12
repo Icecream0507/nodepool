@@ -165,6 +165,55 @@ class PinnedCoreTests(unittest.TestCase):
 
 
 class ConnectivityRoundTests(unittest.TestCase):
+    def test_require_all_stops_retesting_failed_nodes_and_keeps_round_slots(self):
+        cfg = load_config(ROOT / "config.yaml")
+        cfg["connectivity"].update(verification_url=None)
+        values = {"early": [None], "late": [20, 30, None], "good": [20, 30, 40, 50]}
+        calls = {name: 0 for name in values}
+
+        def delay(name, url, timeout, status):
+            index = calls[name]
+            calls[name] += 1
+            return values[name][index]
+
+        api = Mock()
+        api.delay.side_effect = delay
+        with patch.object(mihomo, "Mihomo") as process:
+            process.return_value.__enter__.return_value = api
+            results = mihomo.test_connectivity(
+                Path("unused"), [{"name": name} for name in values], cfg, require_all=True)
+        self.assertEqual(results, {"early": [None] * 4, "late": [20, 30, None, None],
+                                   "good": [20, 30, 40, 50]})
+        self.assertEqual(calls, {"early": 1, "late": 3, "good": 4})
+        process.return_value.__exit__.assert_called_once()
+
+    def test_require_all_needs_positive_integer_delay_and_skips_empty_rounds(self):
+        cfg = load_config(ROOT / "config.yaml")
+        invalid = {"none": None, "zero": 0, "negative": -1, "boolean": True, "float": 1.5}
+        api = Mock()
+        api.delay.side_effect = lambda name, *args: invalid[name]
+        with patch.object(mihomo, "Mihomo") as process:
+            process.return_value.__enter__.return_value = api
+            results = mihomo.test_connectivity(
+                Path("unused"), [{"name": name} for name in invalid], cfg, require_all=True)
+        self.assertEqual(results, {name: [value, None, None, None] for name, value in invalid.items()})
+        self.assertEqual(api.delay.call_count, len(invalid))
+        process.return_value.__exit__.assert_called_once()
+
+    def test_require_all_resets_pruning_for_each_core_batch(self):
+        cfg = load_config(ROOT / "config.yaml")
+        proxies = [{"name": f"node-{n}"} for n in range(65)]
+        api = Mock()
+        api.delay.side_effect = lambda name, *args: 20 if name == "node-64" else None
+        with patch.object(mihomo, "Mihomo") as process:
+            process.return_value.__enter__.return_value = api
+            results = mihomo.test_connectivity(Path("unused"), proxies, cfg, require_all=True)
+        self.assertTrue(all(results[p["name"]] == [None] * 4 for p in proxies[:64]))
+        self.assertEqual(results["node-64"], [20] * 4)
+        self.assertEqual(api.delay.call_count, 68)
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(process.return_value.__exit__.call_count, 2)
+
     def test_optional_second_target_uses_native_api_and_rejects_partial_reachability(self):
         cfg = load_config(ROOT / "config.yaml")
         cfg["connectivity"].update(test_url=DEFAULT_TEST_URL, verification_url=DEFAULT_VERIFICATION_URL)

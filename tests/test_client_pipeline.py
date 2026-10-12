@@ -98,7 +98,7 @@ class CloudClientGateTests(unittest.TestCase):
         self.assertEqual(health_path.read_text(encoding="utf-8"), "expired or corrupt diagnostic report")
 
     def test_expired_report_only_updates_candidates_and_preserves_subscription(self):
-        self.restore.return_value = report(self.cfg, age=169 * 3600)
+        self.restore.return_value = report(self.cfg, age=(self.cfg["publish"]["client_health_max_age_hours"] + 1) * 3600)
         self.assertEqual(self.run_update(), 4)
         self.publisher.assert_not_called()
         self.candidates.assert_called_once()
@@ -108,9 +108,9 @@ class CloudClientGateTests(unittest.TestCase):
 
     def test_remote_report_read_failure_does_not_disable_gate(self):
         self.restore.side_effect = RuntimeError("remote report unreadable")
-        with self.assertRaises(RuntimeError):
-            self.run_update()
-        self.publisher.assert_not_called(); self.candidates.assert_not_called()
+        self.assertEqual(self.run_update(), 4)
+        self.publisher.assert_not_called(); self.candidates.assert_called_once()
+        self.backup.assert_called_once()
         self.assertEqual(self.out.read_text(encoding="utf-8"), "existing subscription")
 
     def test_missing_remote_report_cannot_disable_previously_required_gate(self):
@@ -118,11 +118,24 @@ class CloudClientGateTests(unittest.TestCase):
         client_health.save_report(health_path, report(self.cfg))
         original_health = health_path.read_text(encoding="utf-8")
         self.restore.return_value = None
-        with self.assertRaises(RuntimeError):
-            self.run_update()
-        self.publisher.assert_not_called(); self.candidates.assert_not_called()
+        self.assertEqual(self.run_update(), 4)
+        self.publisher.assert_not_called(); self.candidates.assert_called_once()
+        self.backup.assert_called_once()
         self.assertEqual(self.out.read_text(encoding="utf-8"), "existing subscription")
         self.assertEqual(health_path.read_text(encoding="utf-8"), original_health)
+
+    def test_required_missing_or_disabled_report_only_updates_candidates_and_backup(self):
+        disabled = report(self.cfg); disabled["required"] = False
+        wrong = report(self.cfg); wrong["policy"] = "other-policy"
+        for value in (None, disabled, wrong):
+            with self.subTest(report=value):
+                self.restore.return_value = value
+                self.publisher.reset_mock(); self.candidates.reset_mock(); self.backup.reset_mock()
+                self.assertEqual(self.run_update(), 4)
+                self.publisher.assert_not_called(); self.candidates.assert_called_once()
+                self.backup.assert_called_once()
+                self.assertEqual(len(yaml.safe_load(self.candidates.call_args.args[3])["proxies"]), 3)
+                self.assertEqual(self.out.read_text(encoding="utf-8"), "existing subscription")
 
     def test_preferred_known_nodes_remain_scheduled_without_losing_exploration(self):
         known = {f"known-{i}": {"id": f"known-{i}", "last_ok": 100, "last_test": 100}
@@ -173,7 +186,7 @@ class PublishingClientGateTests(unittest.TestCase):
     def test_cloud_publication_ignores_old_required_failed_expired_and_corrupt_reports(self):
         self.cfg["publish"]["client_health_required"] = False
         for stored in (None, "broken", json.dumps(report(self.cfg, accepted=())),
-                       json.dumps(report(self.cfg, age=169 * 3600))):
+                       json.dumps(report(self.cfg, age=(self.cfg["publish"]["client_health_max_age_hours"] + 1) * 3600))):
             with self.subTest(stored=stored):
                 self.request.reset_mock()
                 self.configure(stored)
@@ -184,7 +197,8 @@ class PublishingClientGateTests(unittest.TestCase):
 
     def test_bad_expired_or_wrong_policy_report_never_patches_subscription(self):
         wrong = report(self.cfg); wrong["policy"] = "old-policy"
-        for stored in ("broken", json.dumps(report(self.cfg, age=169 * 3600)), json.dumps(wrong)):
+        expired = report(self.cfg, age=(self.cfg["publish"]["client_health_max_age_hours"] + 1) * 3600)
+        for stored in ("broken", json.dumps(expired), json.dumps(wrong)):
             with self.subTest(stored=stored):
                 self.request.reset_mock(); self.configure(stored)
                 self.assertIsNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg, candidates=self.content))
@@ -204,6 +218,51 @@ class PublishingClientGateTests(unittest.TestCase):
         self.assertIsNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg, candidates=self.content))
         self.assertEqual([call.args[1] for call in self.request.call_args_list], ["GET"])
         self.assertEqual(health_path.read_text(encoding="utf-8"), original_health)
+
+    def test_required_gate_missing_or_disabled_remote_report_never_publishes(self):
+        disabled = report(self.cfg); disabled["required"] = False
+        for stored in (None, json.dumps(disabled)):
+            with self.subTest(stored=stored):
+                self.request.reset_mock(); self.configure(stored)
+                self.assertIsNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg, candidates=self.content))
+                self.assertEqual([call.args[1] for call in self.request.call_args_list], ["GET"])
+
+    def test_explicit_fresh_report_can_first_enable_required_gate(self):
+        disabled = report(self.cfg); disabled["required"] = False
+        for stored in (None, json.dumps(disabled), "broken"):
+            with self.subTest(stored=stored):
+                self.request.reset_mock(); self.configure(stored)
+                fresh = report(self.cfg)
+                self.assertIsNotNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg,
+                                                      candidates=self.content, client_report=fresh))
+                files = self.request.call_args.args[4]["files"]
+                final = yaml.safe_load(files[self.cfg["publish"]["gist_filename"]]["content"])
+                self.assertEqual([p["server"] for p in final["proxies"]], ["1.1.1.1"])
+                self.assertEqual(json.loads(files[self.cfg["publish"]["client_health_filename"]]["content"]), fresh)
+
+    def test_first_gist_creation_requires_explicit_valid_client_report(self):
+        disabled = report(self.cfg); disabled["required"] = False
+        wrong = report(self.cfg); wrong["policy"] = "other-policy"
+        expired = report(self.cfg, age=(self.cfg["publish"]["client_health_max_age_hours"] + 1) * 3600)
+        invalid_reports = (None, disabled, wrong, expired)
+        with patch.dict("os.environ", {"NODEPOOL_GIST_ID": "", "GITHUB_ACTIONS": "false"}):
+            for value in invalid_reports:
+                with self.subTest(report=value):
+                    self.request.reset_mock()
+                    self.request.side_effect = [response({"id": "created", "owner": {"login": "owner"}}, status=201)]
+                    self.assertIsNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg,
+                                                     candidates=self.content, client_report=value))
+                    self.request.assert_not_called()
+            self.request.reset_mock()
+            self.request.side_effect = [response({"id": "created", "owner": {"login": "owner"}}, status=201)]
+            fresh = report(self.cfg)
+            self.assertIsNotNone(publish.publish(self.root, Mock(), "test", self.content, self.cfg,
+                                                  candidates=self.content, client_report=fresh))
+            self.assertEqual(self.request.call_args.args[1], "POST")
+            files = self.request.call_args.args[4]["files"]
+            final = yaml.safe_load(files[self.cfg["publish"]["gist_filename"]]["content"])
+            self.assertEqual([p["server"] for p in final["proxies"]], ["1.1.1.1"])
+            self.assertEqual(json.loads(files[self.cfg["publish"]["client_health_filename"]]["content"]), fresh)
 
     def test_older_explicit_report_cannot_overwrite_newer_remote_decision(self):
         newer = report(self.cfg, accepted=(1,))
@@ -231,15 +290,39 @@ class LocalVerificationStagesTests(unittest.TestCase):
         self.stack.enter_context(patch.object(mihomo, "prune_invalid", side_effect=lambda exe, ps, *a: ps))
         self.check = self.stack.enter_context(patch.object(mihomo, "validate_subscription"))
         self.tests = self.stack.enter_context(patch.object(mihomo, "test_connectivity"))
+        self.web_tests = self.stack.enter_context(patch.object(mihomo, "test_http_get"))
         self.stack.enter_context(patch.object(log, "disabled", True))
+
+    def test_service_validation_uses_get_without_replacing_native_rounds(self):
+        self.tests.side_effect = lambda exe, ps, cfg, **kwargs: {
+            p["name"]: [20] * cfg["connectivity"]["rounds"] for p in ps
+        }
+        self.web_tests.return_value = {nid: True for nid in self.ids}
+        filtered, health = verify.verify_document(self.text, Path("unused"), self.cfg)
+        self.assertIsNotNone(filtered)
+        self.assertTrue(all(item["ok"] for item in health["nodes"].values()))
+        self.web_tests.assert_called_once()
+        self.assertEqual(self.web_tests.call_args.args[3], {
+            "https://www.gstatic.com/generate_204": 204,
+            "https://github.com/robots.txt": 200,
+            "https://chatgpt.com/cdn-cgi/trace": 200,
+        })
+        self.assertEqual(self.tests.call_count, 2)
+        self.assertTrue(all(call.kwargs.get("require_all") is True for call in self.tests.call_args_list))
+        self.assertTrue(all(call.args[2]["connectivity"]["rounds"] == 4
+                            for call in self.tests.call_args_list))
 
     def test_service_failure_or_second_pass_failure_excludes_node(self):
         for failure_stage in ("service", "confirmation"):
             first = {nid: [20] * 4 for nid in self.ids}
-            web = {nid: [20] * 2 for nid in self.ids}
+            web = {nid: True for nid in self.ids}
             confirm = {nid: [20] * 4 for nid in self.ids}
-            (web if failure_stage == "service" else confirm)[self.ids[1]][-1] = None
-            self.tests.side_effect = [first, web, confirm]
+            if failure_stage == "service":
+                web[self.ids[1]] = False
+            else:
+                confirm[self.ids[1]][-1] = None
+            self.web_tests.return_value = web
+            self.tests.side_effect = [first, confirm]
             with self.subTest(stage=failure_stage):
                 filtered, health = verify.verify_document(self.text, Path("unused"), self.cfg)
                 self.assertTrue(health["nodes"][self.ids[0]]["ok"])
@@ -249,18 +332,20 @@ class LocalVerificationStagesTests(unittest.TestCase):
     def test_incomplete_or_nonpositive_first_pass_cannot_enter_web_checks(self):
         for delays in ([], [20] * 3, [20, 20, 20, -1], [20, 20, 20, True]):
             self.tests.reset_mock()
+            self.web_tests.reset_mock()
             self.tests.side_effect = [{nid: delays for nid in self.ids}]
             with self.subTest(delays=delays):
                 filtered, health = verify.verify_document(self.text, Path("unused"), self.cfg)
                 self.assertIsNone(filtered)
                 self.assertTrue(all(not item["ok"] for item in health["nodes"].values()))
                 self.assertEqual(self.tests.call_count, 1)
+                self.web_tests.assert_not_called()
 
     def test_missing_service_or_confirmation_results_fail_closed(self):
         for stage in ("service", "confirmation"):
             first = {nid: [20] * 4 for nid in self.ids}
-            web = {} if stage == "service" else {nid: [20] * 2 for nid in self.ids}
-            self.tests.side_effect = [first, web, {}]
+            self.web_tests.return_value = {} if stage == "service" else {nid: True for nid in self.ids}
+            self.tests.side_effect = [first, {}]
             with self.subTest(stage=stage):
                 filtered, health = verify.verify_document(self.text, Path("unused"), self.cfg)
                 self.assertIsNone(filtered)

@@ -117,6 +117,23 @@ class ClientHealthFilterTests(unittest.TestCase):
             self.assertIs(client_health.filter_records(records, value, POLICY, now=NOW), records)
             self.assertEqual(client_health.filter_subscription("unchanged text", value, POLICY, now=NOW), "unchanged text")
 
+    def test_required_gate_rejects_absent_disabled_expired_and_wrong_policy_reports(self):
+        disabled = {**report(), "required": False}
+        expired = {**report(), "tested_at": NOW - 24 * 3600}
+        wrong = {**report(), "policy": "other-policy"}
+        records = self.records()
+        text = yaml.safe_dump(self.subscription())
+        for value in (None, disabled, expired, wrong):
+            with self.subTest(report=value):
+                self.assertEqual(client_health.filter_records(records, value, POLICY, now=NOW, required=True), {})
+                self.assertEqual(client_health.filter_records(list(records.values()), value, POLICY, now=NOW, required=True), [])
+                with self.assertRaises(ValueError):
+                    client_health.filter_subscription(text, value, POLICY, now=NOW, required=True)
+
+    def test_required_gate_keeps_only_current_verified_connections(self):
+        selected = client_health.filter_records(self.records(), report(), POLICY, now=NOW, required=True)
+        self.assertEqual(list(selected), [node_id(proxy())])
+
     def test_wrong_policy_and_expired_report_reject_all(self):
         records = self.records()
         self.assertEqual(client_health.filter_records(records, report(), "other", now=NOW), {})

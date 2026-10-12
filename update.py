@@ -61,13 +61,18 @@ def _run(cfg, args) -> int:
         if not cfg["publish"]["client_health_required"]:
             log.info("发布依据云端原生延迟测试与稳定性记录；不要求本机白名单")
         elif token:
-            report = publish.restore_client_health(ROOT, session, token, cfg)
-            if report is not None:
-                client_health.save_report(report_path, report)
-            elif report_path.exists() and client_health.load_report(report_path)["required"]:
-                raise RuntimeError("已启用的远端客户端验证文件缺失，保留原订阅；禁用请显式设置 required=false")
+            try:
+                report = publish.restore_client_health(ROOT, session, token, cfg)
+                if report is not None:
+                    client_health.save_report(report_path, report)
+            except (RuntimeError, ValueError):
+                report = None
+                log.warning("远端本机验证记录不可读；仅更新候选及稳定池，主订阅保留")
         else:
-            report = client_health.load_report(report_path) if report_path.exists() else None
+            try:
+                report = client_health.load_report(report_path) if report_path.exists() else None
+            except ValueError:
+                log.warning("本机验证记录不可读；仅生成候选，主订阅保留")
         remote_ready = True
         if token:
             try:
@@ -98,7 +103,8 @@ def _run(cfg, args) -> int:
         pool.enforce_limits(pl, pc["max_size"], pc["stale_days"])
         pool.save(pool_path, pl)
         preferred = client_health.filter_records(list(pl.values()), report, test_policy,
-                                                 max_age_hours=cfg["publish"]["client_health_max_age_hours"])
+                                                 max_age_hours=cfg["publish"]["client_health_max_age_hours"],
+                                                 required=cfg["publish"]["client_health_required"])
         preferred_ids = {r["id"] for r in preferred} if report and report["required"] else set()
         selection_args = {"preferred_ids": preferred_ids} if preferred_ids else {}
         cands = pool.select_candidates(pl, cfg["collect"]["max_candidates"],
@@ -158,7 +164,8 @@ def _run(cfg, args) -> int:
         atomic_write(ROOT / "output" / "candidates.yaml", candidate_text)
         cloud_total = len(final)
         final = client_health.filter_records(final, report, test_policy,
-                                             max_age_hours=cfg["publish"]["client_health_max_age_hours"])
+                                             max_age_hours=cfg["publish"]["client_health_max_age_hours"],
+                                             required=cfg["publish"]["client_health_required"])
         if not final:
             log.warning("云端合格 %d 个，本机验证白名单没有有效匹配；保留原订阅，候选等待本机复测", cloud_total)
             if token and not args.no_publish and cfg["publish"]["enabled"]:

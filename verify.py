@@ -40,19 +40,20 @@ def verify_document(text: str, exe: Path, cfg: dict) -> tuple[str | None, dict]:
         mc["controller"] = f"127.0.0.1:{sock.getsockname()[1]}"
     valid = mihomo.prune_invalid(exe, proxies, mc["controller"], mc["secret"], mc["startup_timeout"])
     results = {p["name"]: [None] * cfg["connectivity"]["rounds"] for p in proxies}
-    results.update(mihomo.test_connectivity(exe, valid, local_cfg))
+    results.update(mihomo.test_connectivity(exe, valid, local_cfg, require_all=True))
     # A local publishing check is deliberately stricter than exploration: all
-    # four requests, two real service pages and a second full pass must succeed.
+    # four native health checks, three public GET requests and a second full pass
+    # must succeed. Native URLTest uses HEAD, which some service URLs reject.
     eligible = [p for p in valid if _complete_pass(results.get(p["name"]), cfg["connectivity"]["rounds"])]
-    log.info("本机首轮严格通过 %d/%d；继续验证 GitHub、ChatGPT 和第二轮连接", len(eligible), len(proxies))
+    log.info("本机首轮严格通过 %d/%d；继续验证 Google、GitHub、ChatGPT 和第二轮连接", len(eligible), len(proxies))
     if eligible:
-        web_cfg = copy.deepcopy(local_cfg)
-        web_cfg["connectivity"].update(test_url="https://github.com/robots.txt",
-                                       verification_url="https://chatgpt.com/cdn-cgi/trace",
-                                       expected_status=200, rounds=2, min_pass=2)
-        web = mihomo.test_connectivity(exe, eligible, web_cfg)
-        eligible = [p for p in eligible if _complete_pass(web.get(p["name"]), 2)]
-        confirmation = mihomo.test_connectivity(exe, eligible, local_cfg)
+        web = mihomo.test_http_get(exe, eligible, local_cfg, {
+            "https://www.gstatic.com/generate_204": 204,
+            "https://github.com/robots.txt": 200,
+            "https://chatgpt.com/cdn-cgi/trace": 200,
+        })
+        eligible = [p for p in eligible if web.get(p["name"]) is True]
+        confirmation = mihomo.test_connectivity(exe, eligible, local_cfg, require_all=True)
         approved = {p["name"] for p in eligible
                     if _complete_pass(confirmation.get(p["name"]), cfg["connectivity"]["rounds"])}
         for name in results:
@@ -111,7 +112,7 @@ def main() -> int:
             client_health.save_report(ROOT / "data" / "client-health.json", report)
         atomic_write(ROOT / cfg["output"]["file"], filtered)
         atomic_write(ROOT / "output" / "candidates.yaml", source)
-        log.info("本机严格验证完成：%d/%d 个节点；通过两轮多目标 HTTPS 和 GitHub/ChatGPT 访问", count, len(report["nodes"]))
+        log.info("本机严格验证完成：%d/%d 个节点；通过两轮原生 HTTPS 测速及 Google/GitHub/ChatGPT 公开地址 GET", count, len(report["nodes"]))
         return 0
 
 

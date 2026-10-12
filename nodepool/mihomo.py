@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+from contextlib import ExitStack
 import io
 import hashlib
 import os
@@ -24,7 +25,7 @@ from pathlib import Path
 import requests
 import yaml
 
-from .util import dump_yaml, get_with_retry, log
+from .util import dump_yaml, get_with_retry, log, make_session
 from .pool import purity_from_api
 
 RELEASE_API = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
@@ -353,8 +354,9 @@ def build_purity_config(proxies: list[dict], controller: str, secret: str,
 
 # ---------------------------------------------------------------- 测延迟
 
-def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, list[int | None]]:
-    """Repeat Clash's native per-proxy delay test; None means that round failed."""
+def test_connectivity(exe: Path, proxies: list[dict], cfg: dict, *,
+                      require_all: bool = False) -> dict[str, list[int | None]]:
+    """Repeat native delay tests; strict runs stop probing after the first failure."""
     cc = cfg["connectivity"]
     urls = [cc["test_url"]]
     if cc.get("verification_url"):
@@ -372,20 +374,92 @@ def test_connectivity(exe: Path, proxies: list[dict], cfg: dict) -> dict[str, li
         text = build_test_config(batch, mc["controller"], mc["secret"], cfg)
         with Mihomo(exe, text, mc["controller"], mc["secret"], int(mc["startup_timeout"])) as core:
             with cf.ThreadPoolExecutor(max_workers=conc) as executor:
+                active = batch
                 for rnd in range(1, rounds + 1):
+                    if require_all:
+                        active_names = {p["name"] for p in active}
+                        if not active:
+                            for p in batch:
+                                results[p["name"]].extend([None] * (rounds - rnd + 1))
+                            log.info("  连通性批次 %d-%d：全部节点已失败，跳过剩余 %d 轮",
+                                     start + 1, start + len(batch), rounds - rnd + 1)
+                            break
+                        for p in batch:
+                            if p["name"] not in active_names:
+                                results[p["name"]].append(None)
                     url = urls[(rnd - 1) % len(urls)]
                     futures = {executor.submit(core.delay, p["name"], url,
                                                tmo, cc.get("expected_status")): p["name"]
-                               for p in batch}
+                               for p in active}
                     ok = 0
+                    passed = set()
                     for future in cf.as_completed(futures):
                         name = futures[future]
                         delay = future.result()
                         results[name].append(delay)
-                        if delay is not None:
+                        valid = type(delay) is int and delay > 0 if require_all else delay is not None
+                        if valid:
                             ok += 1
+                            passed.add(name)
                     log.info("  连通性批次 %d-%d，第 %d/%d 轮：%d/%d 通过",
-                             start + 1, start + len(batch), rnd, rounds, ok, len(batch))
+                             start + 1, start + len(batch), rnd, rounds, ok, len(active))
+                    if require_all:
+                        active = [p for p in active if p["name"] in passed]
+    return results
+
+
+def test_http_get(exe: Path, proxies: list[dict], cfg: dict,
+                  targets: dict[str, int]) -> dict[str, bool]:
+    """Check real GET responses through an isolated listener for each proxy."""
+    if not targets:
+        raise ValueError("HTTP GET checks require at least one target")
+    results = {p["name"]: False for p in proxies}
+    if not proxies:
+        return results
+    targets = dict(targets)
+    cc, mc = cfg["connectivity"], cfg["mihomo"]
+    timeout = float(cc["timeout_ms"]) / 1000
+    concurrency = min(8, int(cc["concurrency"]))
+    for start in range(0, len(proxies), 64):
+        batch = proxies[start:start + 64]
+        # Hold all allocations together so listeners and the controller cannot
+        # receive the same port. Release immediately before starting the core.
+        with ExitStack() as reservations:
+            ports = []
+            for _ in range(len(batch) + 1):
+                sock = reservations.enter_context(socket.socket())
+                sock.bind(("127.0.0.1", 0))
+                ports.append(sock.getsockname()[1])
+            controller = f"127.0.0.1:{ports[0]}"
+            document = yaml.safe_load(build_test_config(batch, controller, mc["secret"], cfg))
+            document["listeners"] = [
+                {"name": f"http-get-{i}", "type": "mixed", "listen": "127.0.0.1", "port": port}
+                for i, port in enumerate(ports[1:])
+            ]
+            # Keep subscription DNS rules after the forced inbound routes.
+            document["rules"] = [f"IN-NAME,http-get-{i},{p['name']}" for i, p in enumerate(batch)] + document["rules"]
+            text = dump_yaml(document)
+            port_map = {p["name"]: port for p, port in zip(batch, ports[1:])}
+
+        def one(name: str) -> tuple[str, bool]:
+            with make_session(f"http://127.0.0.1:{port_map[name]}") as session:
+                for url, expected in targets.items():
+                    try:
+                        with session.get(url, timeout=timeout, allow_redirects=False) as response:
+                            if response.status_code != expected:
+                                return name, False
+                    except requests.RequestException:
+                        return name, False
+            return name, True
+
+        with Mihomo(exe, text, controller, mc["secret"], int(mc["startup_timeout"])):
+            with cf.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [executor.submit(one, p["name"]) for p in batch]
+                for future in cf.as_completed(futures):
+                    name, passed = future.result()
+                    results[name] = passed
+        log.info("  HTTP GET 服务检查批次 %d-%d：%d/%d 通过", start + 1, start + len(batch),
+                 sum(results[p["name"]] for p in batch), len(batch))
     return results
 
 

@@ -101,6 +101,7 @@ class ConnectivityPolicyTests(unittest.TestCase):
 
     def test_full_update_excludes_recent_unselected_legacy_evidence(self):
         cfg = load_config(ROOT / "config.yaml")
+        cfg["publish"]["client_health_required"] = False
         current = qualified("1.1.1.1")
         legacy = qualified()
         records = {r["id"]: r for r in (current, legacy)}

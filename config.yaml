@@ -68,10 +68,10 @@ output:
 
 publish:
   enabled: true                 # 有 token 就自动发布到 secret gist
-  client_health_required: false  # 云端检测通过即可发布，不要求本机白名单
+  client_health_required: true   # 主订阅只收录本机严格通过的节点
   gist_filename: "clash.yaml"
   pool_filename: "stable-pool.json" # 同一 secret gist 备份稳定节点，缓存丢失时恢复
   candidate_filename: "candidates.yaml" # 云端合格候选，供本机复测，不直接导入客户端
-  client_health_filename: "client-health.json" # 本机验证白名单，verify.py 写入后启用
-  client_health_max_age_hours: 168 # 本机证明有效期；云端仍独立复测，过期保留原订阅
+  client_health_filename: "client-health.json" # verify.py 发布的本机严格验证白名单
+  client_health_max_age_hours: 12 # 本机证明有效期；过期只更新候选，不放行未知节点
   gist_description: "nodepool auto-updated clash subscription"

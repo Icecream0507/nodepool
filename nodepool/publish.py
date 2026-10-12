@@ -213,6 +213,7 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
         payload["files"][cfg["publish"]["candidate_filename"]] = {"content": candidates}
     if records is not None:
         payload["files"].update(_stable_file(records, cfg))
+    data = None
     if gid:
         # 更新前确认目标可读且为 secret，避免把节点内容写入 public gist。
         existing = _request(session, "GET", f"{API}/{gid}", token)
@@ -224,34 +225,42 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
             if data.get("public") is not False:
                 log.error("目标 Gist 不是 secret，停止发布")
                 return None
-            # A local diagnostic report gates cloud publication only when
-            # explicitly enabled in project configuration.
-            if cfg["publish"]["client_health_required"] or client_report is not None:
-                from .client_health import filter_subscription, load_report, validate_report
-                from .pool import connectivity_policy
-                report = client_report
-                remote_report = _file_content(data, cfg["publish"]["client_health_filename"], session, token)
-                previous_report = validate_report(json.loads(remote_report)) if remote_report is not None else None
-                local_report_path = root / "data" / "client-health.json"
-                if previous_report is None and client_report is None and local_report_path.exists():
-                    if load_report(local_report_path)["required"]:
-                        raise ValueError("已启用的远端验证文件缺失")
-                if report is None:
-                    report = previous_report
-                else:
-                    report = validate_report(report)
-                    if previous_report is not None and previous_report["tested_at"] > report["tested_at"]:
-                        raise ValueError("已有更新的客户端验证记录")
-                    payload["files"][cfg["publish"]["client_health_filename"]] = {
-                        "content": json.dumps(report, ensure_ascii=False, separators=(",", ":"))}
-                if report is not None:
-                    payload["files"][fn]["content"] = filter_subscription(
-                        candidates if candidates is not None else content, report,
-                        connectivity_policy(cfg["connectivity"]),
-                        max_age_hours=cfg["publish"]["client_health_max_age_hours"])
         except (ValueError, AttributeError, KeyError, TypeError):
-            log.error("Gist 或客户端验证状态异常/无合格节点，保留原订阅")
+            log.error("Gist 状态异常，保留原订阅")
             return None
+
+    # Configuration owns the gate. Missing or disabled evidence cannot switch
+    # it off, including when a new fixed subscription is first created.
+    if cfg["publish"]["client_health_required"] or client_report is not None:
+        from .client_health import filter_subscription, validate_report
+        from .pool import connectivity_policy
+        try:
+            previous_report = None
+            remote_report = (_file_content(data, cfg["publish"]["client_health_filename"], session, token)
+                             if data is not None else None)
+            if remote_report is not None:
+                try:
+                    previous_report = validate_report(json.loads(remote_report))
+                except (ValueError, TypeError):
+                    # A fresh explicit local verification can repair invalid
+                    # old evidence; automatic cloud updates must hold instead.
+                    if client_report is None:
+                        raise
+            report = previous_report if client_report is None else validate_report(client_report)
+            if (client_report is not None and previous_report is not None
+                    and previous_report["tested_at"] > report["tested_at"]):
+                raise ValueError("已有更新的客户端验证记录")
+            payload["files"][fn]["content"] = filter_subscription(
+                candidates if candidates is not None else content, report,
+                connectivity_policy(cfg["connectivity"]),
+                max_age_hours=cfg["publish"]["client_health_max_age_hours"], required=True)
+            if client_report is not None:
+                payload["files"][cfg["publish"]["client_health_filename"]] = {
+                    "content": json.dumps(report, ensure_ascii=False, separators=(",", ":"))}
+        except (ValueError, AttributeError, KeyError, TypeError):
+            log.error("客户端验证状态异常/无合格节点，保留原订阅")
+            return None
+    if gid:
         r = _request(session, "PATCH", f"{API}/{gid}", token, payload)
     else:
         if os.environ.get("GITHUB_ACTIONS") == "true":

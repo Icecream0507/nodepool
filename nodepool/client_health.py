@@ -95,13 +95,14 @@ def build_report(results: dict, proxies: list[dict], connectivity: dict,
     return validate_report(report, now=now)
 
 
-def _allowed(report: dict | None, policy: str, now: float | None, max_age_hours: float) -> set[str] | None:
+def _allowed(report: dict | None, policy: str, now: float | None, max_age_hours: float,
+             required: bool = False) -> set[str] | None:
     if report is None:
-        return None
+        return set() if required else None
     current = time.time() if now is None else now
     validate_report(report, now=current)
     if not report["required"]:
-        return None
+        return set() if required else None
     if type(max_age_hours) not in (int, float) or not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("client health maximum age must be positive and finite")
     if report["policy"] != policy or current - report["tested_at"] >= max_age_hours * 3600:
@@ -110,9 +111,10 @@ def _allowed(report: dict | None, policy: str, now: float | None, max_age_hours:
 
 
 def filter_records(records: list[dict] | dict[str, dict], report: dict | None,
-                   policy: str, *, now: float | None = None, max_age_hours: float = 24):
+                   policy: str, *, now: float | None = None, max_age_hours: float = 24,
+                   required: bool = False):
     """Select verified connections without changing pool records or their history."""
-    allowed = _allowed(report, policy, now, max_age_hours)
+    allowed = _allowed(report, policy, now, max_age_hours, required)
     if allowed is None:
         return records
     if isinstance(records, dict):
@@ -191,9 +193,10 @@ def _repair_rules(value, removed: set[str], fallback: str):
 
 
 def filter_subscription(text: str, report: dict | None, policy: str, *,
-                        now: float | None = None, max_age_hours: float = 24) -> str:
+                        now: float | None = None, max_age_hours: float = 24,
+                        required: bool = False) -> str:
     """Filter a subscription and repair references; reject an empty publication."""
-    allowed = _allowed(report, policy, now, max_age_hours)
+    allowed = _allowed(report, policy, now, max_age_hours, required)
     if allowed is None:
         return text
     try:

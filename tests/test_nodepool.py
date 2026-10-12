@@ -37,7 +37,11 @@ def tearDownModule():
 
 
 def config():
-    return load_config(ROOT / "config.yaml")
+    cfg = load_config(ROOT / "config.yaml")
+    # These pool/publishing tests exercise explicit cloud-only operation;
+    # required client verification has its own pipeline regression suite.
+    cfg["publish"]["client_health_required"] = False
+    return cfg
 
 
 def record(server="8.8.8.8"):
