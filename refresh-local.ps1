@@ -19,20 +19,30 @@ $env:PYTHONUNBUFFERED = "1"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $verifyArguments = @("-u", (Join-Path $projectRoot "verify.py"))
 if ($Core) { $verifyArguments += @("--core", $Core) }
-if ($Direct) { $verifyArguments += "--proxy=" }
 $resultCode = 1
 Push-Location -LiteralPath $projectRoot
 try {
     "[$(Get-Date -Format o)] Starting local verification" | Out-File -LiteralPath $logPath -Encoding utf8 -Append
     $pythonCommand = Get-Command -Name $Python -CommandType Application -ErrorAction Stop
     for ($attempt = 1; $attempt -le 3; $attempt++) {
-        "[$(Get-Date -Format o)] Attempt $attempt/3" | Out-File -LiteralPath $logPath -Encoding utf8 -Append
+        # Only GitHub download/publishing uses this route. Node verification
+        # continues to dial each candidate directly regardless of --proxy.
+        $useDirect = [bool]$Direct
+        if ($attempt % 2 -eq 0) { $useDirect = -not $useDirect }
+        $attemptArguments = @($verifyArguments)
+        $routeName = "configured proxy"
+        if ($useDirect) {
+            $attemptArguments += "--proxy="
+            $routeName = "direct"
+        }
+        "[$(Get-Date -Format o)] Attempt $attempt/3; GitHub route: $routeName" |
+            Out-File -LiteralPath $logPath -Encoding utf8 -Append
         # Python logging writes to stderr; native stderr must be logged rather than
         # converted into a terminating PowerShell error on Windows PowerShell 5.1.
         $ErrorActionPreference = "Continue"
         try {
             $LASTEXITCODE = $null
-            & $pythonCommand.Source @verifyArguments 2>&1 |
+            & $pythonCommand.Source @attemptArguments 2>&1 |
                 ForEach-Object { $_.ToString() } |
                 Out-File -LiteralPath $logPath -Encoding utf8 -Append -ErrorAction Stop
             if ($null -eq $LASTEXITCODE) { throw "Python did not return an exit code" }
