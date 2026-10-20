@@ -44,7 +44,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-mihomo-${{ hashFiles('nodepool/mihomo.py', 'config.yaml') }}
 
       - name: Prepare mihomo for native validation
-        run: python -c "from pathlib import Path; from nodepool.config import load_config; from nodepool.mihomo import ensure_binary; from nodepool.util import make_session; ensure_binary(Path('.'), make_session(None), load_config(Path('config.yaml'))['mihomo']['version'])"
+        run: python -c "from pathlib import Path; from nodepool.config import load_config; from nodepool.mihomo import ensure_binary, ensure_compat_binary; from nodepool.util import make_session; s = make_session(None); c = load_config(Path('config.yaml')); ensure_binary(Path('.'), s, c['mihomo']['version']); ensure_compat_binary(Path('.'), s, c)"
 
       - name: Validate logic and native core
         run: python -m unittest discover -s tests -v

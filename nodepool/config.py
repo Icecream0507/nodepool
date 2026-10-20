@@ -18,10 +18,12 @@ DEFAULTS = {
              "stable_max_fail": 12, "stable_grace_days": 7, "cooldown_hours": 24,
              "exploration_ratio": 0.25},
     "output": {"group_select": "🚀 节点选择", "group_stable": "🛡️ 稳定节点",
-               "max_test_age_hours": 12, "group_other": "其他节点"},
+               "max_test_age_hours": 12, "group_other": "其他节点",
+               # 旧版 mihomo 遇到一个未知协议就拒绝整份订阅（anytls < v1.19.2，mieru < v1.19.0）
+               "exclude_types": ["anytls", "mieru"]},
     "purity": {"batch_size": 16, "max_seconds": 420, "enabled": True, "required": True},
     "search": {"max_seconds": 420},
-    "mihomo": {"version": None},
+    "mihomo": {"version": None, "compat_version": None},
     "publish": {"pool_filename": "stable-pool.json", "candidate_filename": "candidates.yaml",
                 "client_health_filename": "client-health.json", "client_health_max_age_hours": 168,
                 "client_health_required": False},
@@ -124,13 +126,17 @@ def validate_config(cfg: dict) -> None:
                          ("mihomo", "secret")):
         if not isinstance(cfg[section].get(key), str) or not cfg[section][key].strip():
             raise ValueError(f"{section}.{key} 不能为空")
+    excluded = cfg["output"].get("exclude_types")
+    if not isinstance(excluded, list) or any(not isinstance(t, str) or not t.strip() for t in excluded):
+        raise ValueError("output.exclude_types 必须是协议类型字符串列表")
     if type(cfg["publish"].get("enabled")) is not bool:
         raise ValueError("publish.enabled 必须为布尔值")
     if type(cfg["publish"].get("client_health_required")) is not bool:
         raise ValueError("publish.client_health_required 必须为布尔值")
-    version = cfg["mihomo"].get("version")
-    if version is not None and (not isinstance(version, str) or re.fullmatch(r"v\d+\.\d+\.\d+", version) is None):
-        raise ValueError("mihomo.version 必须为 v主版本.次版本.修订号 或 null")
+    for key in ("version", "compat_version"):
+        version = cfg["mihomo"].get(key)
+        if version is not None and (not isinstance(version, str) or re.fullmatch(r"v\d+\.\d+\.\d+", version) is None):
+            raise ValueError(f"mihomo.{key} 必须为 v主版本.次版本.修订号 或 null")
     filenames = [cfg["publish"][key] for key in
                  ("gist_filename", "pool_filename", "candidate_filename", "client_health_filename")]
     if len(set(filenames)) != len(filenames):

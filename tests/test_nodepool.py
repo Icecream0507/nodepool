@@ -287,6 +287,29 @@ class OutputAndConfigTests(unittest.TestCase):
     def test_empty_subscription_is_rejected(self):
         with self.assertRaises(ValueError): output.build_subscription([], config())
 
+    def test_protocols_unknown_to_older_clients_are_never_published(self):
+        # mihomo < v1.19.2 rejects the whole file: "proxy N: unsupport proxy type: anytls".
+        anytls = qualified("1.1.1.1")
+        anytls["proxy"] = {"name": "a", "type": "anytls", "server": "1.1.1.1", "port": 443, "password": "x"}
+        cfg = config()
+        text, stats = output.build_subscription([qualified(), anytls], cfg)
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual([p["type"] for p in yaml.safe_load(text)["proxies"]], ["http"])
+        # Files built by older versions (remote candidates, published subscriptions) are cleaned too.
+        old = yaml.safe_load(text)
+        old["proxies"].append({**anytls["proxy"], "name": "legacy-anytls"})
+        old["proxies"].append({"name": "legacy-mieru", "type": "mieru", "server": "2.2.2.2", "port": 443,
+                               "transport": "TCP", "username": "u", "password": "p"})
+        migrated = yaml.safe_load(output.simplify_subscription(yaml.safe_dump(old, allow_unicode=True), cfg))
+        self.assertEqual([p["type"] for p in migrated["proxies"]], ["http"])
+        for group in migrated["proxy-groups"]:
+            self.assertFalse({"legacy-anytls", "legacy-mieru"} & set(group["proxies"]))
+        cfg["output"]["exclude_types"] = []
+        self.assertEqual(output.build_subscription([qualified(), anytls], cfg)[1]["total"], 2)
+        for value in ("anytls", [""], None):
+            cfg = config(); cfg["output"]["exclude_types"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError): validate_config(cfg)
+
     def test_stable_nodes_remain_directly_selectable_without_extra_groups(self):
         r = qualified(); r["stable"] = True
         text, stats = output.build_subscription([r], config())
@@ -378,6 +401,17 @@ class MainTests(unittest.TestCase):
         self.stack.enter_context(patch.object(pool, "select_candidates", side_effect=lambda pl, *args: [pl[self.rec["id"]]]))
         self.assertEqual(self.run_update(), 0)
         self.assertEqual(len(yaml.safe_load(self.out.read_text(encoding="utf-8"))["proxies"]), 2)
+
+    def test_nodes_the_compat_baseline_cannot_parse_are_not_published(self):
+        other = qualified("1.1.1.1"); self.pl[other["id"]] = other
+        compat = Path("compat-core")
+        self.stack.enter_context(patch.object(mihomo, "ensure_compat_binary", return_value=compat))
+        self.stack.enter_context(patch.object(mihomo, "prune_invalid", side_effect=lambda exe, ps, *a: [
+            p for p in ps if exe != compat or p["server"] != "1.1.1.1"]))
+        self.assertEqual(self.run_update(), 0)
+        doc = yaml.safe_load(self.out.read_text(encoding="utf-8"))
+        self.assertEqual([p["server"] for p in doc["proxies"]], [self.rec["proxy"]["server"]])
+        self.assertIs(self.validate.call_args.args[3], compat)
 
     def test_validation_failure_preserves_previous_output(self):
         self.validate.side_effect = RuntimeError("invalid")
@@ -563,6 +597,8 @@ class ControllerPortTests(unittest.TestCase):
 
 
 EXE = ROOT / "bin" / ("mihomo.exe" if os.name == "nt" else "mihomo")
+_COMPAT_NAME = f"mihomo-compat-{load_config(ROOT / 'config.yaml')['mihomo']['compat_version']}"
+COMPAT_EXE = ROOT / "bin" / (_COMPAT_NAME + ".exe" if os.name == "nt" else _COMPAT_NAME)
 
 
 @unittest.skipUnless(EXE.exists(), "local mihomo binary unavailable")
@@ -580,6 +616,16 @@ class NativeMihomoTests(unittest.TestCase):
               {**qualified()["proxy"], "name": "good"}]
         valid = mihomo.prune_invalid(EXE, ps, "127.0.0.1:19090", "test", 10)
         self.assertEqual([p["name"] for p in valid], ["good"])
+
+    @unittest.skipUnless(COMPAT_EXE.exists(), "compat baseline mihomo unavailable")
+    def test_compat_baseline_core_parses_subscription_and_rejects_newer_protocols(self):
+        text = output.build_subscription([qualified()], config())[0]
+        mihomo.validate_subscription(EXE, text, compat_exe=COMPAT_EXE)
+        ps = [{"name": "new", "type": "anytls", "server": "8.8.8.8", "port": 443, "password": "x"},
+              {**qualified()["proxy"], "name": "old"}]
+        self.assertEqual(len(mihomo.prune_invalid(EXE, ps, "127.0.0.1:19090", "test", 10)), 2)
+        valid = mihomo.prune_invalid(COMPAT_EXE, ps, "127.0.0.1:19090", "test", 10)
+        self.assertEqual([p["name"] for p in valid], ["old"])
 
     def test_process_starts_stops_and_cleans_temporary_files(self):
         with socket.socket() as sock:

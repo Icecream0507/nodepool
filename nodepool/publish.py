@@ -41,9 +41,10 @@ def _request(session, method, url, token, payload=None, retries=3):
             response = session.request(method, url, headers=_headers(token), json=payload, timeout=40)
             if response.status_code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
                 return response
-        except requests.RequestException:
+        except requests.RequestException as exc:
             if attempt == retries - 1:
-                log.error("Gist %s 请求失败：网络连接或超时", method)
+                # 只记异常类型：消息里含 gist ID，云端日志是公开的。
+                log.error("Gist %s 请求失败：网络连接或超时（%s）", method, type(exc).__name__)
                 return None
         time.sleep(2 * (attempt + 1))
     return None

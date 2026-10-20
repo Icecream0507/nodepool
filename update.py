@@ -107,7 +107,9 @@ def _run(cfg, args) -> int:
                                                  required=cfg["publish"]["client_health_required"])
         preferred_ids = {r["id"] for r in preferred} if report and report["required"] else set()
         selection_args = {"preferred_ids": preferred_ids} if preferred_ids else {}
-        cands = pool.select_candidates(pl, cfg["collect"]["max_candidates"],
+        # 客户端不兼容的协议不占测试名额，也不记录误导性的失败历史。
+        compatible = {nid: r for nid, r in pl.items() if output.client_compatible(r["proxy"], cfg)}
+        cands = pool.select_candidates(compatible, cfg["collect"]["max_candidates"],
                                        pc["exploration_ratio"], score_limit, **selection_args)
         alive_ids = set()
         exe = mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"]) if cands else None
@@ -145,11 +147,21 @@ def _run(cfg, args) -> int:
         log.info("晋升稳定节点 %d 个；进入冷却 %d 个", promoted, retired)
         # 未轮到复测的节点在连通性有效期内继续服务；可选评分不阻止输出。
         now = time.time()
-        final = [r for r in pl.values() if r.get("last_ok", 0) > 0
+        final = [r for r in compatible.values() if r.get("last_ok", 0) > 0
                  and pool.tested_with_policy(r, test_policy)
                  and r.get("last_test") == r.get("last_ok") and r.get("fail_streak", 0) == 0
                  and 0 <= now - r["last_ok"] < cfg["output"]["max_test_age_hours"] * 3600
                  and (score_limit is None or (pool.fresh_purity(r, cache_h) and r["purity"]["score"] <= score_limit))]
+        # 旧版客户端遇到一个无法解析的节点就拒绝整份订阅，发布前按兼容基线内核剔除。
+        compat_exe = mihomo.ensure_compat_binary(ROOT, session, cfg)
+        if compat_exe is not None and final:
+            mc = cfg["mihomo"]
+            kept = {p["name"] for p in mihomo.prune_invalid(
+                compat_exe, [{**r["proxy"], "name": r["id"]} for r in final],
+                mc["controller"], mc["secret"], mc["startup_timeout"])}
+            if len(kept) != len(final):
+                log.info("兼容基线 %s 无法解析，剔除 %d 个节点", mc["compat_version"], len(final) - len(kept))
+            final = [r for r in final if r["id"] in kept]
         log.info("最终入选：%d 个（稳定 %d 个）", len(final), sum(bool(r.get("stable")) for r in final))
         if not final:
             log.error("本轮没有通过有效期内检测的合格节点，保留原订阅，不发布空结果")
@@ -160,7 +172,7 @@ def _run(cfg, args) -> int:
         candidate_text, _ = output.build_subscription(final, cfg)
         if exe is None:
             exe = mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"])
-        mihomo.validate_subscription(exe, candidate_text, cfg["mihomo"]["startup_timeout"])
+        mihomo.validate_subscription(exe, candidate_text, cfg["mihomo"]["startup_timeout"], compat_exe)
         atomic_write(ROOT / "output" / "candidates.yaml", candidate_text)
         cloud_total = len(final)
         final = client_health.filter_records(final, report, test_policy,
@@ -181,7 +193,7 @@ def _run(cfg, args) -> int:
             raise RuntimeError("订阅没有可输出的节点")
         if exe is None:
             exe = mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"])
-        mihomo.validate_subscription(exe, sub_text, cfg["mihomo"]["startup_timeout"])
+        mihomo.validate_subscription(exe, sub_text, cfg["mihomo"]["startup_timeout"], compat_exe)
         out_path = ROOT / cfg["output"]["file"]
         atomic_write(out_path, sub_text)
         # 发布前持久化；网络错误不能丢失本轮积累。

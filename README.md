@@ -103,6 +103,19 @@ gist，**订阅链接固定不变**。
 生成的订阅是 mihomo 格式，适用于 **Clash Verge Rev / FlClash / Mihomo Party** 等
 mihomo 内核客户端（旧版 Clash for Windows 不支持 vless）。
 
+客户端内核遇到一个不认识的节点就会拒绝整份订阅（如 `unsupport proxy type: anytls`），
+因此订阅按 `mihomo.compat_version`（默认 `v1.16.0`，2023-09）保证兼容，覆盖所有
+Clash Verge Rev、FlClash、Mihomo Party 版本：
+
+- `output.exclude_types`（默认 `anytls`、`mieru`）中的协议不测试也不输出。
+- 云端与本机发布前都会下载兼容基线内核到 `bin/`，剔除它无法解析的节点，并用它再校验
+  完整订阅；校验失败时保留原订阅。以后出现的新协议或新字段同样会被自动拦截。
+- DNS 等结构字段使用旧版也能解析的写法，订阅结构本身可被 Clash.Meta v1.12 解析。
+
+需要兼容更老的内核时调低 `compat_version`：`v1.14.5` 会再排除 hysteria2 与 tuic v5，
+`v1.12.0` 还会排除 vless `xtls-rprx-vision`（Reality 类节点）。调低 `v1.14.x` 及更早版本时，
+旧内核校验需要 GeoIP 数据，目前未自动准备。
+
 - 导入订阅链接后，务必在客户端打开 **“通过代理更新订阅”**，因为链接在
   `gist.githubusercontent.com` 上，国内直连通常失败。
 - `🚀 节点选择` 是规则模式的唯一入口，默认选中 `♻️ 自动选择`，也直接列出所有合格节点。
@@ -184,6 +197,7 @@ verify.py          本机严格复测与白名单发布
 config.yaml        所有参数
 .env               你的 GitHub token（自建，git 忽略）
 bin/mihomo.exe     内核（自动下载）
+bin/mihomo-compat-v1.16.0.exe  兼容基线内核（自动下载，仅做配置解析校验）
 data/pool.json     节点池（持久化，记录测活历史、稳定身份及最近纯净度结果）
 data/gist.json     已发布 gist 的 id
 data/client-health.json  已发布本机验证白名单

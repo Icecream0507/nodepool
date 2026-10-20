@@ -43,6 +43,7 @@ class LocalVerificationResumeTests(unittest.TestCase):
                                                         side_effect=lambda exe, proxies, *args: {
                                                             proxy["name"]: True for proxy in proxies}))
         self.validate = self.stack.enter_context(patch.object(mihomo, "validate_subscription"))
+        self.stack.enter_context(patch.object(mihomo, "ensure_compat_binary", return_value=None))
 
     @staticmethod
     def passing_native(exe, proxies, cfg, **kwargs):
@@ -139,7 +140,7 @@ class LocalVerificationResumeTests(unittest.TestCase):
         candidate = self.root / "candidate.yaml"
         candidate.write_text(self.text, encoding="utf-8")
 
-        def verified(source, exe, cfg, *, checkpoint_path):
+        def verified(source, exe, cfg, *, checkpoint_path, compat_exe):
             self.assertEqual(checkpoint_path, self.checkpoint)
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             checkpoint_path.write_text("complete checkpoint", encoding="utf-8")

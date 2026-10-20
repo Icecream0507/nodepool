@@ -35,7 +35,8 @@ def build_dns_config(group_select: str) -> dict:
             f"https://1.1.1.1/dns-query#{group_select}",
             f"https://8.8.8.8/dns-query#{group_select}",
         ],
-        "nameserver-policy": {"+.cn": list(domestic)},
+        # Clash.Meta <= v1.13 only accepts a single string here; a list fails the whole file.
+        "nameserver-policy": {"+.cn": domestic[0]},
         # Explicitly avoid GeoIP DNS filtering, including in offline validation.
         "fallback-filter": {"geoip": False},
     }
@@ -86,11 +87,19 @@ def _selection_layout(document: dict, cfg: dict) -> dict:
     return document
 
 
+def client_compatible(proxy: dict, cfg: dict) -> bool:
+    """One unknown proxy type makes older clients reject the whole subscription."""
+    return proxy.get("type") not in cfg["output"]["exclude_types"]
+
+
 def simplify_subscription(text: str, cfg: dict) -> str:
     """Migrate a generated subscription without changing node settings or identities."""
     document = yaml.safe_load(text)
     if not isinstance(document, dict):
         raise ValueError("订阅必须是 YAML 对象")
+    if isinstance(document.get("proxies"), list):
+        document["proxies"] = [p for p in document["proxies"]
+                               if not isinstance(p, dict) or client_compatible(p, cfg)]
     return dump_yaml(_selection_layout(document, cfg))
 
 
@@ -146,6 +155,8 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     proxies = []
     stats = {label: 0 for label in labels}
     for rec in final:
+        if not client_compatible(rec["proxy"], cfg):
+            continue
         purity = rec.get("purity") if isinstance(rec.get("purity"), dict) else {}
         t = tier_of(purity.get("score"), tiers)
         if not t and cfg["purity"].get("required", True):

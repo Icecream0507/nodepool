@@ -94,7 +94,8 @@ def _verify_batch(proxies: list[dict], exe: Path, local_cfg: dict) -> dict:
 
 
 def verify_document(text: str, exe: Path, cfg: dict, *,
-                    checkpoint_path: Path | None = None) -> tuple[str | None, dict]:
+                    checkpoint_path: Path | None = None,
+                    compat_exe: Path | None = None) -> tuple[str | None, dict]:
     text = output.simplify_subscription(text, cfg)
     document = yaml.safe_load(text)
     if not isinstance(document, dict) or not isinstance(document.get("proxies"), list) or not document["proxies"]:
@@ -109,6 +110,14 @@ def verify_document(text: str, exe: Path, cfg: dict, *,
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         mc["controller"] = f"127.0.0.1:{sock.getsockname()[1]}"
+    if compat_exe is not None:
+        # 兼容基线内核无法解析的节点不测试，也就不会进入白名单和订阅。
+        compatible = mihomo.prune_invalid(compat_exe, proxies, mc["controller"], mc["secret"], mc["startup_timeout"])
+        if len(compatible) != len(proxies):
+            log.info("兼容基线 %s 无法解析，跳过 %d 个候选", cfg["mihomo"]["compat_version"], len(proxies) - len(compatible))
+        if not compatible:
+            raise ValueError("候选中没有兼容基线内核可解析的节点")
+        proxies = compatible
     checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     policy = pool.connectivity_policy(cfg["connectivity"])
     progress = _load_progress(checkpoint_path, [p["name"] for p in proxies], policy)
@@ -138,7 +147,7 @@ def verify_document(text: str, exe: Path, cfg: dict, *,
         if any(r["ok"] for r in report["nodes"].values()):
             raise
         return None, report
-    mihomo.validate_subscription(exe, filtered, mc["startup_timeout"])
+    mihomo.validate_subscription(exe, filtered, mc["startup_timeout"], compat_exe)
     return filtered, report
 
 
@@ -166,8 +175,10 @@ def main() -> int:
             if source is None:
                 raise RuntimeError("远端没有候选或订阅文件")
         exe = args.core.resolve() if args.core else mihomo.ensure_binary(ROOT, session, cfg["mihomo"]["version"])
+        compat_exe = mihomo.ensure_compat_binary(ROOT, session, cfg)
         checkpoint_path = ROOT / "data" / "local-verification-progress.json"
-        filtered, report = verify_document(source, exe, cfg, checkpoint_path=checkpoint_path)
+        filtered, report = verify_document(source, exe, cfg, checkpoint_path=checkpoint_path,
+                                           compat_exe=compat_exe)
         atomic_write(ROOT / "data" / "local-verification.json", json.dumps(report, ensure_ascii=False, indent=2))
         if filtered is None:
             checkpoint_path.unlink(missing_ok=True)

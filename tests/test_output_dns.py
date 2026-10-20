@@ -61,7 +61,9 @@ class OutputDnsTests(unittest.TestCase):
 
     def test_domestic_dns_can_work_without_a_proxy(self):
         dns = subscription()[0]["dns"]
-        for address in dns["nameserver-policy"]["+.cn"] + dns["direct-nameserver"]:
+        # A single string keeps the policy parseable by Clash.Meta <= v1.13.
+        self.assertIsInstance(dns["nameserver-policy"]["+.cn"], str)
+        for address in [dns["nameserver-policy"]["+.cn"]] + dns["direct-nameserver"]:
             self.assertNotIn("#", address)
         self.assertEqual(route_for_cn_answer(subscription()[0]["rules"], "www.example.cn"), "DIRECT")
 

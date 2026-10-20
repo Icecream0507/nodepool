@@ -289,6 +289,7 @@ class LocalVerificationStagesTests(unittest.TestCase):
         self.stack = contextlib.ExitStack(); self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(mihomo, "prune_invalid", side_effect=lambda exe, ps, *a: ps))
         self.check = self.stack.enter_context(patch.object(mihomo, "validate_subscription"))
+        self.stack.enter_context(patch.object(mihomo, "ensure_compat_binary", return_value=None))
         self.tests = self.stack.enter_context(patch.object(mihomo, "test_connectivity"))
         self.web_tests = self.stack.enter_context(patch.object(mihomo, "test_http_get"))
         self.stack.enter_context(patch.object(log, "disabled", True))
@@ -311,6 +312,20 @@ class LocalVerificationStagesTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs.get("require_all") is True for call in self.tests.call_args_list))
         self.assertTrue(all(call.args[2]["connectivity"]["rounds"] == 4
                             for call in self.tests.call_args_list))
+
+    def test_candidates_the_compat_baseline_cannot_parse_are_never_tested(self):
+        compat = Path("compat-core")
+        self.stack.enter_context(patch.object(mihomo, "prune_invalid", side_effect=lambda exe, ps, *a: [
+            p for p in ps if exe != compat or p["name"] == self.ids[0]]))
+        self.tests.side_effect = lambda exe, ps, cfg, **kwargs: {
+            p["name"]: [20] * cfg["connectivity"]["rounds"] for p in ps
+        }
+        self.web_tests.side_effect = lambda exe, ps, *a: {p["name"]: True for p in ps}
+        filtered, health = verify.verify_document(self.text, Path("unused"), self.cfg, compat_exe=compat)
+        self.assertEqual(list(health["nodes"]), [self.ids[0]])
+        self.assertTrue(all(p["name"] == self.ids[0] for call in self.tests.call_args_list for p in call.args[1]))
+        self.assertEqual(len(yaml.safe_load(filtered)["proxies"]), 1)
+        self.assertIs(self.check.call_args.args[3], compat)
 
     def test_service_failure_or_second_pass_failure_excludes_node(self):
         for failure_stage in ("service", "confirmation"):

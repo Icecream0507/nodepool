@@ -42,9 +42,10 @@ def _arch() -> str:
     return m
 
 
-def ensure_binary(root: Path, session: requests.Session, version: str | None = None) -> Path:
+def ensure_binary(root: Path, session: requests.Session, version: str | None = None,
+                  name: str = "mihomo") -> Path:
     system = platform.system().lower()
-    target = root / "bin" / ("mihomo.exe" if system == "windows" else "mihomo")
+    target = root / "bin" / (name + ".exe" if system == "windows" else name)
     if target.exists() and target.stat().st_size > 1_000_000:
         if version is None:
             return target
@@ -64,16 +65,18 @@ def ensure_binary(root: Path, session: requests.Session, version: str | None = N
         raise RuntimeError(f"获取 mihomo release 失败：{getattr(r,'status_code','ERR')}")
     names = {a["name"]: a["browser_download_url"] for a in r.json().get("assets", [])}
     arch = _arch()
+    # v1.16 及更早的发布名为 clash.meta- / Clash.Meta-，兼容基线内核需要下载它们。
+    prefix = r"(?:mihomo|clash\.meta)"
     if system == "windows":
-        pats = [rf"mihomo-windows-{arch}-compatible-v[\d.]+\.zip$",
-                rf"mihomo-windows-{arch}-v[\d.]+\.zip$"]
+        pats = [rf"{prefix}-windows-{arch}-compatible-v[\d.]+\.zip$",
+                rf"{prefix}-windows-{arch}-v[\d.]+\.zip$"]
     else:  # linux（CI runner）等：发布的是 .gz 压缩的单个二进制
-        pats = [rf"mihomo-{system}-{arch}-compatible-v[\d.]+\.gz$",
-                rf"mihomo-{system}-{arch}-v[\d.]+\.gz$"]
+        pats = [rf"{prefix}-{system}-{arch}-compatible-v[\d.]+\.gz$",
+                rf"{prefix}-{system}-{arch}-v[\d.]+\.gz$"]
     pick = None
     for pat in pats:
         for n in names:
-            if re.match(pat, n):
+            if re.match(pat, n, re.IGNORECASE):
                 pick = n
                 break
         if pick:
@@ -112,6 +115,14 @@ def ensure_binary(root: Path, session: requests.Session, version: str | None = N
             os.unlink(tmp)
     log.info("  内核已保存：%s", target)
     return target
+
+
+def ensure_compat_binary(root: Path, session: requests.Session, cfg: dict) -> Path | None:
+    """订阅必须能被最旧的目标客户端内核解析；未配置基线时返回 None。"""
+    version = cfg["mihomo"].get("compat_version")
+    if not version or version == cfg["mihomo"].get("version"):
+        return None
+    return ensure_binary(root, session, version, name=f"mihomo-compat-{version}")
 
 
 # ---------------------------------------------------------------- 进程管理
@@ -287,7 +298,8 @@ def check_config(exe: Path, text: str, timeout: int = 20) -> None:
             raise RuntimeError(f"mihomo 配置检查失败：{detail}")
 
 
-def validate_subscription(exe: Path, text: str, timeout: int = 20) -> None:
+def validate_subscription(exe: Path, text: str, timeout: int = 20,
+                          compat_exe: Path | None = None) -> None:
     config = yaml.safe_load(text)
     if not config.get("proxies"):
         raise RuntimeError("拒绝生成空订阅")
@@ -299,6 +311,8 @@ def validate_subscription(exe: Path, text: str, timeout: int = 20) -> None:
         # DNS fallback 默认也会加载 GeoIP，即使 rules 中没有 GEOIP。
         config["dns"].setdefault("fallback-filter", {})["geoip"] = False
     check_config(exe, dump_yaml(config), timeout)
+    if compat_exe is not None:
+        check_config(compat_exe, dump_yaml(config), timeout)
 
 
 def build_test_config(proxies: list[dict], controller: str, secret: str,
