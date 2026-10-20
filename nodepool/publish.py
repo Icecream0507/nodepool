@@ -261,10 +261,11 @@ def publish(root: Path, session, token: str, content: str, cfg: dict,
         except (ValueError, AttributeError, KeyError, TypeError):
             log.error("客户端验证状态异常/无合格节点，保留原订阅")
             return None
-    from .output import build_shadowrocket
+    from .output import build_shadowrocket, build_shadowrocket_conf
     # Same nodes as the final Clash file, so both links always agree.
     payload["files"][cfg["publish"]["shadowrocket_filename"]] = {
         "content": build_shadowrocket(payload["files"][fn]["content"])}
+    payload["files"][cfg["publish"]["shadowrocket_conf_filename"]] = {"content": build_shadowrocket_conf(cfg)}
     if gid:
         r = _request(session, "PATCH", f"{API}/{gid}", token, payload)
     else:

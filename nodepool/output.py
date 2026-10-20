@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
 
 import yaml
@@ -173,6 +174,52 @@ def build_shadowrocket(text: str) -> str:
             raise ValueError("节点格式无效")
         lines.append("  - " + json.dumps(_shadowrocket_proxy(proxy), ensure_ascii=False))
     return "\n".join(lines) + "\n"
+
+
+def build_shadowrocket_conf(cfg: dict) -> str:
+    """Shadowrocket drops a subscription's groups, so auto-select ships as a config."""
+    g_select, g_auto = cfg["output"]["group_select"], cfg["output"]["group_auto"]
+    if any(c in name for name in (g_select, g_auto) for c in ",=\n"):
+        raise ValueError("代理组名称不能包含逗号、等号或换行")
+    # _pretty_name puts a tier label in every node name; match on those so the
+    # group picks up this subscription's nodes without listing them.
+    labels = [t[2] for t in cfg["purity"]["tiers"]] + [cfg["output"].get("group_other", "其他节点")]
+    nodes = "|".join(re.escape(label) for label in labels)
+    timeout = max(1, cfg["connectivity"]["timeout_ms"] // 1000)
+    return "\n".join([
+        "# nodepool 自动生成：节点来自同一 gist 的 shadowrocket.yaml 订阅，这里只提供分组和分流规则。",
+        f"# {g_select} 默认走 {g_auto}；选 PROXY 则使用首页点选的节点。",
+        "[General]",
+        "bypass-system = true",
+        "skip-proxy = 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 127.0.0.1, localhost, *.local, captive.apple.com",
+        "dns-server = 223.5.5.5, 119.29.29.29",
+        "fallback-dns-server = system",
+        # Nodes are tested over IPv4 only, as in the Clash file.
+        "ipv6 = false",
+        "prefer-ipv6 = false",
+        "private-ip-answer = true",
+        "hijack-dns = *:53",
+        # Most nodes are HTTP proxies without UDP: make QUIC fall back to TCP.
+        "udp-policy-not-supported-behaviour = REJECT",
+        "block-quic = all-proxy",
+        "",
+        "[Proxy Group]",
+        f"{g_select} = select,{g_auto},PROXY,select=0",
+        # 300s instead of Clash's 180s: gentler on phone battery and data.
+        f"{g_auto} = url-test,url={cfg['connectivity']['test_url']},interval=300,tolerance=50,"
+        f"timeout={timeout},select=0,policy-regex-filter={nodes}",
+        "",
+        "[Rule]",
+        *proxy_domain_rules(g_select),
+        "DOMAIN-SUFFIX,cn,DIRECT",
+        "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+        "GEOIP,CN,DIRECT",
+        f"FINAL,{g_select}",
+        "",
+    ])
 
 
 def tier_of(score: int | None, tiers: list) -> tuple[int, str] | None:

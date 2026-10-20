@@ -6,6 +6,7 @@ import copy
 import io
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import tempfile
@@ -303,6 +304,35 @@ class OutputAndConfigTests(unittest.TestCase):
                 output.build_shadowrocket(empty)
         cfg = config(); cfg["publish"]["shadowrocket_filename"] = cfg["publish"]["gist_filename"]
         with self.assertRaises(ValueError): validate_config(cfg)
+
+    def test_shadowrocket_conf_auto_group_matches_every_generated_node(self):
+        cfg = config()
+        recs = [qualified(f"8.8.8.{i}") for i in range(1, 4)]
+        recs[1]["purity"]["score"] = 30  # a tier label instead of the "other" label
+        recs[2].update(purity=None, latency_ms=None)  # no latency suffix in the name
+        names = [p["name"] for p in yaml.safe_load(output.build_subscription(recs, cfg)[0])["proxies"]]
+        cfg["purity"]["required"] = True; cfg["purity"]["max_score"] = 40
+        names += [p["name"] for p in yaml.safe_load(output.build_subscription(recs[:2], cfg)[0])["proxies"]]
+        conf = output.build_shadowrocket_conf(config())
+        sections = {}
+        for line in conf.splitlines():
+            if line.startswith("["):
+                current = sections.setdefault(line, [])
+            elif line and not line.startswith("#"):
+                current.append(line)
+        self.assertEqual(list(sections), ["[General]", "[Proxy Group]", "[Rule]"])
+        select, auto = sections["[Proxy Group]"]
+        g_select, g_auto = cfg["output"]["group_select"], cfg["output"]["group_auto"]
+        self.assertTrue(select.startswith(f"{g_select} = select,{g_auto},PROXY,"))
+        self.assertTrue(auto.startswith(f"{g_auto} = url-test,url={cfg['connectivity']['test_url']},"))
+        regex = dict(opt.split("=", 1) for opt in auto.split(" = ", 1)[1].split(",")[1:])["policy-regex-filter"]
+        self.assertTrue(all(re.search(regex, name) for name in names), names)
+        self.assertFalse(any(re.search(regex, g) for g in (g_select, g_auto, "DIRECT", "PROXY")))
+        rules = sections["[Rule]"]
+        self.assertIn(f"DOMAIN-SUFFIX,chatgpt.com,{g_select}", rules)
+        self.assertEqual(rules[-2:], ["GEOIP,CN,DIRECT", f"FINAL,{g_select}"])
+        bad = config(); bad["output"]["group_auto"] = "a,b"
+        with self.assertRaises(ValueError): output.build_shadowrocket_conf(bad)
 
     def test_optional_purity_settings_are_validated(self):
         for key in ("required", "enabled"):

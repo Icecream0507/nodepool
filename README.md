@@ -144,9 +144,20 @@ GitHub 检测和客户端检测发生在不同网络，结果可能不同。节�
 调整：ws 路径里的 `?ed=` 转成显式 early-data 字段，HTTP/SOCKS5 只缺用户名或只缺密码时
 去掉这半套凭据，与 mihomo 验证时的实际连接行为一致。
 
-在 Shadowrocket 里点右上角 `+`，类型选 `Subscribe`，填入链接。节点分组、DNS 和分流规则
-由 Shadowrocket 自身配置负责，订阅只提供节点；可在首页对订阅做连通性测试，再选延迟低的节点。
-首次添加时手机需要能访问 `gist.githubusercontent.com`。连上节点后，后续更新会经过代理。
+Shadowrocket 会忽略订阅里的代理组和规则，所以同一 gist 里另有 `shadowrocket.conf`
+（`publish.shadowrocket_conf_filename`），提供与 Clash 版对应的 `🚀 节点选择`、
+`♻️ 自动选择`（url-test，300 秒检测一次，比 Clash 的 180 秒更省电）和分流规则。
+自动选择组用 `policy-regex-filter` 按节点名称里的档位标签（如 `其他节点`）收集订阅节点，
+不需要逐个列出节点。
+
+使用步骤：
+
+1. 首页右上角 `+`，类型选 `Subscribe`，填入 `shadowrocket.yaml` 链接。
+2. 底部「配置」页右上角 `+`，填入 `shadowrocket.conf` 链接下载，点它选「使用配置」。
+3. 首页「全局路由」选「配置」。`🚀 节点选择` 默认是 `♻️ 自动选择`；要固定节点，
+   在该组里选 `PROXY`，再在首页点选节点。
+
+首次添加时，手机需要能访问 `gist.githubusercontent.com`。连上节点后，后续更新会走代理。
 
 ## 本机验证后发布
 
