@@ -135,6 +135,19 @@ GitHub 检测和客户端检测发生在不同网络，结果可能不同。节�
 云端测量值；实际使用以本机 Clash 的实时检测为准。全部候选失效时，自动选择也无法恢复
 不可达的服务器；节点池会保留历史并在后续更新中复测。
 
+### Shadowrocket（iOS）
+
+每次发布 `clash.yaml` 时，同一 gist 里会同时更新 `shadowrocket.yaml`（文件名见
+`publish.shadowrocket_filename`），链接只是把末尾的 `clash.yaml` 换成 `shadowrocket.yaml`。
+两份订阅的节点完全相同，都来自同一次本机严格验证。Shadowrocket 版只含 `proxies:` 列表，
+格式与 Sub-Store 的 Shadowrocket 输出一致（每行一个 JSON 节点）。字段也按小火箭的习惯做了
+调整：ws 路径里的 `?ed=` 转成显式 early-data 字段，HTTP/SOCKS5 只缺用户名或只缺密码时
+去掉这半套凭据，与 mihomo 验证时的实际连接行为一致。
+
+在 Shadowrocket 里点右上角 `+`，类型选 `Subscribe`，填入链接。节点分组、DNS 和分流规则
+由 Shadowrocket 自身配置负责，订阅只提供节点；可在首页对订阅做连通性测试，再选延迟低的节点。
+首次添加时手机需要能访问 `gist.githubusercontent.com`。连上节点后，后续更新会经过代理。
+
 ## 本机验证后发布
 
 如果云端通过的节点在本机大量超时，可在实际使用订阅的电脑运行：
@@ -201,7 +214,7 @@ bin/mihomo-compat-v1.16.0.exe  兼容基线内核（自动下载，仅做配置�
 data/pool.json     节点池（持久化，记录测活历史、稳定身份及最近纯净度结果）
 data/gist.json     已发布 gist 的 id
 data/client-health.json  已发布本机验证白名单
-output/clash.yaml  订阅文件本地副本
+output/clash.yaml  订阅文件本地副本（gist 中另有同节点的 shadowrocket.yaml）
 output/candidates.yaml 云端候选，不直接导入客户端
 ```
 

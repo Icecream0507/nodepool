@@ -181,6 +181,9 @@ class PublishingClientGateTests(unittest.TestCase):
         payload = self.request.call_args.args[4]
         final = yaml.safe_load(payload["files"][self.cfg["publish"]["gist_filename"]]["content"])
         self.assertEqual([p["server"] for p in final["proxies"]], ["8.8.8.8"])
+        # The Shadowrocket link carries exactly the client-verified nodes, not the candidates.
+        shadowrocket = yaml.safe_load(payload["files"][self.cfg["publish"]["shadowrocket_filename"]]["content"])
+        self.assertEqual(shadowrocket, {"proxies": final["proxies"]})
         self.assertEqual(len(yaml.safe_load(payload["files"][self.cfg["publish"]["candidate_filename"]]["content"])["proxies"]), 3)
 
     def test_cloud_publication_ignores_old_required_failed_expired_and_corrupt_reports(self):

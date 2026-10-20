@@ -25,6 +25,7 @@ DEFAULTS = {
     "search": {"max_seconds": 420},
     "mihomo": {"version": None, "compat_version": None},
     "publish": {"pool_filename": "stable-pool.json", "candidate_filename": "candidates.yaml",
+                "shadowrocket_filename": "shadowrocket.yaml",
                 "client_health_filename": "client-health.json", "client_health_max_age_hours": 168,
                 "client_health_required": False},
 }
@@ -123,7 +124,7 @@ def validate_config(cfg: dict) -> None:
                          ("publish", "gist_filename"), ("publish", "gist_description"),
                          ("publish", "pool_filename"),
                          ("publish", "candidate_filename"), ("publish", "client_health_filename"),
-                         ("mihomo", "secret")):
+                         ("publish", "shadowrocket_filename"), ("mihomo", "secret")):
         if not isinstance(cfg[section].get(key), str) or not cfg[section][key].strip():
             raise ValueError(f"{section}.{key} 不能为空")
     excluded = cfg["output"].get("exclude_types")
@@ -138,9 +139,10 @@ def validate_config(cfg: dict) -> None:
         if version is not None and (not isinstance(version, str) or re.fullmatch(r"v\d+\.\d+\.\d+", version) is None):
             raise ValueError(f"mihomo.{key} 必须为 v主版本.次版本.修订号 或 null")
     filenames = [cfg["publish"][key] for key in
-                 ("gist_filename", "pool_filename", "candidate_filename", "client_health_filename")]
+                 ("gist_filename", "pool_filename", "candidate_filename", "client_health_filename",
+                  "shadowrocket_filename")]
     if len(set(filenames)) != len(filenames):
-        raise ValueError("订阅、候选、稳定池和客户端检测文件名不能相同")
+        raise ValueError("订阅、候选、稳定池、客户端检测和 Shadowrocket 文件名不能相同")
     tiers = cfg["purity"].get("tiers")
     if not isinstance(tiers, list) or not tiers:
         raise ValueError("purity.tiers 不能为空")

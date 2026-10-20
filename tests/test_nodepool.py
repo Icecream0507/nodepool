@@ -269,6 +269,41 @@ class OutputAndConfigTests(unittest.TestCase):
         self.assertNotIn("仅收录系数", text)
         mihomo.validate_subscription(EXE, text) if EXE.exists() else None
 
+    def test_shadowrocket_copy_keeps_nodes_and_uses_its_field_conventions(self):
+        text = output.build_subscription([qualified()], config())[0]
+        doc = yaml.safe_load(text)
+        doc["proxies"] += [
+            {"name": "ws", "type": "vless", "server": "a.example", "port": 443, "uuid": "u", "tls": True,
+             "sni": "s.example", "network": "ws", "ws-opts": {"path": "/x?ed=2560&k=v"}, "flow": None},
+            {"name": "keep", "type": "vmess", "server": "b.example", "port": 443, "uuid": "u", "cipher": "auto",
+             "alterId": 0, "servername": "real.example", "sni": "other.example",
+             "network": "ws", "ws-opts": {"path": "", "_private": 1}},
+            {"name": "hy2", "type": "hysteria2", "server": "c.example", "port": 443, "password": "p",
+             "tls": True, "alpn": "h3", "tfo": True},
+            {"name": "bad-tls", "type": "http", "server": "d.example", "port": 443, "tls": "yes"},
+            {"name": "half", "type": "http", "server": "e.example", "port": 443, "password": "None", "username": None},
+            {"name": "auth", "type": "socks5", "server": "f.example", "port": 1080, "username": "u", "password": "p"},
+        ]
+        sr = yaml.safe_load(output.build_shadowrocket(yaml.safe_dump(doc, allow_unicode=True)))
+        self.assertEqual(list(sr), ["proxies"])
+        self.assertEqual([p["name"] for p in sr["proxies"]], [p["name"] for p in doc["proxies"]])
+        self.assertEqual(sr["proxies"][0], doc["proxies"][0])  # TLS HTTP proxies pass through unchanged
+        ws, keep, hy2, bad, half, auth = sr["proxies"][1:]
+        self.assertFalse({"username", "password"} & set(half))
+        self.assertEqual((auth["username"], auth["password"]), ("u", "p"))
+        self.assertEqual((ws["servername"], "sni" in ws, "flow" in ws), ("s.example", False, False))
+        self.assertEqual(ws["ws-opts"], {"path": "/x?k=v", "early-data-header-name": "Sec-WebSocket-Protocol",
+                                         "max-early-data": 2560})
+        self.assertEqual((keep["servername"], "sni" in keep, keep["ws-opts"]), ("real.example", False, {"path": "/"}))
+        self.assertEqual((hy2["alpn"], hy2["fast-open"], "tls" in hy2), (["h3"], True, False))
+        self.assertNotIn("tls", bad)
+        self.assertEqual(doc["proxies"][1]["ws-opts"]["path"], "/x?ed=2560&k=v")  # input untouched
+        for empty in ("proxies: []\n", "{}\n", "[]\n"):
+            with self.subTest(empty=empty), self.assertRaises(ValueError):
+                output.build_shadowrocket(empty)
+        cfg = config(); cfg["publish"]["shadowrocket_filename"] = cfg["publish"]["gist_filename"]
+        with self.assertRaises(ValueError): validate_config(cfg)
+
     def test_optional_purity_settings_are_validated(self):
         for key in ("required", "enabled"):
             cfg = config(); cfg["purity"][key] = "false"

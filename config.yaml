@@ -79,6 +79,7 @@ publish:
   gist_filename: "clash.yaml"
   pool_filename: "stable-pool.json" # 同一 secret gist 备份稳定节点，缓存丢失时恢复
   candidate_filename: "candidates.yaml" # 云端合格候选，供本机复测，不直接导入客户端
+  shadowrocket_filename: "shadowrocket.yaml" # 与 clash.yaml 同一批节点，仅 proxies 列表，供 Shadowrocket 导入
   client_health_filename: "client-health.json" # verify.py 发布的本机严格验证白名单
   client_health_max_age_hours: 12 # 本机证明有效期；过期只更新候选，不放行未知节点
   gist_description: "nodepool auto-updated clash subscription"

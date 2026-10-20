@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import time
 
 import yaml
@@ -101,6 +102,77 @@ def simplify_subscription(text: str, cfg: dict) -> str:
         document["proxies"] = [p for p in document["proxies"]
                                if not isinstance(p, dict) or client_compatible(p, cfg)]
     return dump_yaml(_selection_layout(document, cfg))
+
+
+# Shadowrocket imports a Clash-style proxy list and ignores groups, DNS and
+# rules. Mirror Sub-Store's Shadowrocket producer, the de facto reference.
+_SHADOWROCKET_NO_TLS_KEY = {"trojan", "tuic", "hysteria", "hysteria2", "anytls"}
+
+
+def _ws_early_data(opts: dict) -> None:
+    """Shadowrocket expects Xray's `?ed=` path hint as explicit early-data fields."""
+    path, sep, query = str(opts.get("path") or "/").partition("?")
+    parts = [part for part in query.split("&") if part] if sep else []
+    ed = [part[3:] for part in parts if part.startswith("ed=")]
+    if not ed or not ed[-1].isdigit():
+        return
+    rest = [part for part in parts if not part.startswith("ed=")]
+    opts["path"] = path + ("?" + "&".join(rest) if rest else "")
+    if opts.get("v2ray-http-upgrade"):
+        opts["v2ray-http-upgrade-fast-open"] = True
+        opts.pop("early-data-header-name", None)
+        opts.pop("max-early-data", None)
+        return
+    if opts.get("early-data-header-name") is None:
+        opts["early-data-header-name"] = "Sec-WebSocket-Protocol"
+    if opts.get("max-early-data") is None:
+        opts["max-early-data"] = int(ed[-1])
+
+
+def _shadowrocket_proxy(proxy: dict) -> dict:
+    p = copy.deepcopy(proxy)
+    kind = p.get("type")
+    if kind in ("vmess", "vless") and "sni" in p:
+        # mihomo verified the node with servername; keep it when both exist.
+        sni = p.pop("sni")
+        p.setdefault("servername", sni)
+    if kind == "hysteria" and "auth-str" not in p and "auth_str" in p:
+        p["auth-str"] = p.pop("auth_str")
+    if kind in ("tuic", "hysteria", "hysteria2"):
+        if isinstance(p.get("alpn"), str):
+            p["alpn"] = [p["alpn"]]
+        if p.get("tfo") and not p.get("fast-open"):
+            p["fast-open"] = p["tfo"]
+    if p.get("network") == "ws":
+        opts = p["ws-opts"] = dict(p.get("ws-opts") or {})
+        opts["path"] = opts.get("path") or "/"
+        _ws_early_data(opts)
+    if kind in _SHADOWROCKET_NO_TLS_KEY or not isinstance(p.get("tls", False), bool):
+        p.pop("tls", None)
+    for opts in [p] + [v for k, v in p.items() if k.endswith("-opts") and isinstance(v, dict)]:
+        for key in [k for k, v in opts.items() if v is None or str(k).startswith("_")]:
+            del opts[key]
+    # mihomo, which verified these nodes, only authenticates when it has a
+    # username (HTTP: both fields); don't let Shadowrocket send half a credential.
+    if kind in ("http", "socks5") and not (p.get("username") and (kind == "socks5" or p.get("password"))):
+        p.pop("username", None)
+        p.pop("password", None)
+    return p
+
+
+def build_shadowrocket(text: str) -> str:
+    """Shadowrocket copy of a finished subscription: same nodes, proxies only."""
+    document = yaml.safe_load(text)
+    proxies = document.get("proxies") if isinstance(document, dict) else None
+    if not isinstance(proxies, list) or not proxies:
+        raise ValueError("没有可输出的节点，拒绝生成空 Shadowrocket 订阅")
+    # Same shape as Sub-Store: one JSON flow mapping per YAML list item.
+    lines = ["proxies:"]
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            raise ValueError("节点格式无效")
+        lines.append("  - " + json.dumps(_shadowrocket_proxy(proxy), ensure_ascii=False))
+    return "\n".join(lines) + "\n"
 
 
 def tier_of(score: int | None, tiers: list) -> tuple[int, str] | None:
