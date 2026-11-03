@@ -18,7 +18,7 @@ DEFAULTS = {
              "stable_max_fail": 12, "stable_grace_days": 7, "cooldown_hours": 24,
              "exploration_ratio": 0.25},
     "output": {"group_select": "🚀 节点选择", "group_stable": "🛡️ 稳定节点",
-               "max_test_age_hours": 12, "group_other": "其他节点",
+               "group_clean": "✨ 纯净", "max_test_age_hours": 12, "group_other": "其他节点",
                # 旧版 mihomo 遇到一个未知协议就拒绝整份订阅（anytls < v1.19.2，mieru < v1.19.0）
                "exclude_types": ["anytls", "mieru"]},
     "purity": {"batch_size": 16, "max_seconds": 420, "enabled": True, "required": True},
@@ -120,7 +120,7 @@ def validate_config(cfg: dict) -> None:
         if u.scheme not in ("http", "https") or not u.hostname:
             raise ValueError(f"{section}.{key} 必须是 HTTP(S) URL")
     for section, key in (("search", "query"), ("output", "file"), ("output", "group_auto"),
-                         ("output", "group_select"), ("output", "group_stable"),
+                         ("output", "group_select"), ("output", "group_stable"), ("output", "group_clean"),
                          ("publish", "gist_filename"), ("publish", "gist_description"),
                          ("publish", "pool_filename"),
                          ("publish", "candidate_filename"), ("publish", "client_health_filename"),
@@ -148,7 +148,7 @@ def validate_config(cfg: dict) -> None:
     if not isinstance(tiers, list) or not tiers:
         raise ValueError("purity.tiers 不能为空")
     previous = 0
-    labels = [cfg["output"][k] for k in ("group_auto", "group_select", "group_stable", "group_other")]
+    labels = [cfg["output"][k] for k in ("group_auto", "group_select", "group_stable", "group_clean", "group_other")]
     if any(not isinstance(name, str) or not name.strip() for name in labels):
         raise ValueError("代理组名称不能为空")
     for tier in tiers:

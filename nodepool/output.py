@@ -12,6 +12,10 @@ from .util import dump_yaml, flag_emoji
 
 TEST_URL = "https://www.gstatic.com/generate_204"
 
+# Node names carry this mark when the node is in the stable pool, so the stable
+# auto-select group (and the Shadowrocket config) can collect it by name alone.
+STABLE_MARK = "稳定"
+
 # Keep frequently blocked services ahead of GEOIP: a poisoned CN answer must
 # never turn these domains into direct traffic. No extra GeoSite download needed.
 PROXY_DOMAINS = (
@@ -56,24 +60,45 @@ def _selection_layout(document: dict, cfg: dict) -> dict:
         raise ValueError("没有可输出的节点，拒绝生成空订阅")
     group_auto = cfg["output"]["group_auto"]
     group_select = cfg["output"]["group_select"]
+    group_clean = cfg["output"]["group_clean"]
+    group_stable = cfg["output"]["group_stable"]
+    reserved = {group_auto, group_select, group_clean, group_stable, "DIRECT", "REJECT", "GLOBAL"}
     names = []
     for proxy in proxies:
         if (not isinstance(proxy, dict) or not isinstance(proxy.get("name"), str)
-                or not proxy["name"] or proxy["name"] in (group_auto, group_select, "DIRECT", "REJECT", "GLOBAL")):
+                or not proxy["name"] or proxy["name"] in reserved):
             raise ValueError("节点名称无效或与代理组冲突")
         names.append(proxy["name"])
     if len(set(names)) != len(names):
         raise ValueError("节点名称重复")
-    group = {"name": group_auto, "type": "url-test", "proxies": names,
-             "url": cfg["connectivity"]["test_url"], "interval": 180,
-             "timeout": cfg["connectivity"]["timeout_ms"],
-             "tolerance": 50, "lazy": False}
-    if cfg["connectivity"].get("expected_status") is not None:
-        group["expected-status"] = cfg["connectivity"]["expected_status"]
+
+    def url_test(name: str, members: list[str]) -> dict:
+        group = {"name": name, "type": "url-test", "proxies": members,
+                 "url": cfg["connectivity"]["test_url"], "interval": 180,
+                 "timeout": cfg["connectivity"]["timeout_ms"],
+                 "tolerance": 50, "lazy": False}
+        if cfg["connectivity"].get("expected_status") is not None:
+            group["expected-status"] = cfg["connectivity"]["expected_status"]
+        return group
+
+    # Curated subgroups are name-derivable: the cleanest tier carries its label,
+    # stable nodes carry STABLE_MARK. Empty subgroups are omitted so the file
+    # never ships a group with no members.
+    clean_label = cfg["purity"]["tiers"][0][2]
+    clean_names = [n for n in names if clean_label in n]
+    stable_names = [n for n in names if STABLE_MARK in n]
+    auto_groups = [url_test(group_auto, names)]
+    options = [group_auto]
+    if clean_names:
+        auto_groups.append(url_test(group_clean, clean_names))
+        options.append(group_clean)
+    if stable_names:
+        auto_groups.append(url_test(group_stable, stable_names))
+        options.append(group_stable)
     document["mode"] = "rule"
     document["proxy-groups"] = [
-        {"name": group_select, "type": "select", "proxies": [group_auto, *names]},
-        group,
+        {"name": group_select, "type": "select", "proxies": [*options, *names]},
+        *auto_groups,
     ]
     document["dns"] = build_dns_config(group_select)
     document["rules"] = [
@@ -179,13 +204,23 @@ def build_shadowrocket(text: str) -> str:
 def build_shadowrocket_conf(cfg: dict) -> str:
     """Shadowrocket drops a subscription's groups, so auto-select ships as a config."""
     g_select, g_auto = cfg["output"]["group_select"], cfg["output"]["group_auto"]
-    if any(c in name for name in (g_select, g_auto) for c in ",=\n"):
+    g_clean, g_stable = cfg["output"]["group_clean"], cfg["output"]["group_stable"]
+    if any(c in name for name in (g_select, g_auto, g_clean, g_stable) for c in ",=\n"):
         raise ValueError("代理组名称不能包含逗号、等号或换行")
     # _pretty_name puts a tier label in every node name; match on those so the
     # group picks up this subscription's nodes without listing them.
     labels = [t[2] for t in cfg["purity"]["tiers"]] + [cfg["output"].get("group_other", "其他节点")]
     nodes = "|".join(re.escape(label) for label in labels)
     timeout = max(1, cfg["connectivity"]["timeout_ms"] // 1000)
+
+    def auto_line(name: str, regex: str) -> str:
+        # 300s instead of Clash's 180s: gentler on phone battery and data.
+        return (f"{name} = url-test,url={cfg['connectivity']['test_url']},interval=300,tolerance=50,"
+                f"timeout={timeout},select=0,policy-regex-filter={regex}")
+
+    # Curated subgroups match the cleanest tier label and the stable mark.
+    clean_regex = re.escape(cfg["purity"]["tiers"][0][2])
+    stable_regex = re.escape(STABLE_MARK)
     return "\n".join([
         "# nodepool 自动生成：节点来自同一 gist 的 shadowrocket.yaml 订阅，这里只提供分组和分流规则。",
         f"# {g_select} 默认走 {g_auto}；选 PROXY 则使用首页点选的节点。",
@@ -204,10 +239,10 @@ def build_shadowrocket_conf(cfg: dict) -> str:
         "block-quic = all-proxy",
         "",
         "[Proxy Group]",
-        f"{g_select} = select,{g_auto},PROXY,select=0",
-        # 300s instead of Clash's 180s: gentler on phone battery and data.
-        f"{g_auto} = url-test,url={cfg['connectivity']['test_url']},interval=300,tolerance=50,"
-        f"timeout={timeout},select=0,policy-regex-filter={nodes}",
+        f"{g_select} = select,{g_auto},{g_clean},{g_stable},PROXY,select=0",
+        auto_line(g_auto, nodes),
+        auto_line(g_clean, clean_regex),
+        auto_line(g_stable, stable_regex),
         "",
         "[Rule]",
         *proxy_domain_rules(g_select),
@@ -242,6 +277,8 @@ def _pretty_name(rec: dict, label: str, used: set) -> str:
     parts = [flag, cc or "??", str(score) if type(score) is int and 0 <= score <= 100 else "未评分", label]
     if kind:
         parts.append(kind)
+    if rec.get("stable"):
+        parts.append(STABLE_MARK)
     base = " ".join(parts)
     if lat:
         base += f" · {lat}ms"
@@ -260,6 +297,8 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     g_auto = cfg["output"]["group_auto"]
     g_select = cfg["output"]["group_select"]
     g_other = cfg["output"].get("group_other", "其他节点")
+    g_clean = cfg["output"]["group_clean"]
+    g_stable = cfg["output"]["group_stable"]
 
     # Stability and measured latency take priority over reference IP scores.
     def sort_key(r):
@@ -270,7 +309,7 @@ def build_subscription(final: list[dict], cfg: dict) -> tuple[str, dict]:
     final = sorted(final, key=sort_key)
 
     labels = [t[2] for t in tiers] + [g_other]
-    used: set = {g_auto, g_select, "DIRECT", "REJECT", "GLOBAL"}
+    used: set = {g_auto, g_select, g_clean, g_stable, "DIRECT", "REJECT", "GLOBAL"}
     proxies = []
     stats = {label: 0 for label in labels}
     for rec in final:

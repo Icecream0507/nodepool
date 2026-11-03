@@ -64,9 +64,13 @@ mihomo:
 
 output:
   file: "output/clash.yaml"
-  # 规则入口默认自动，也能直接点击节点手动固定；不生成评分或稳定子组
+  # 规则入口默认自动，也能直接点击节点手动固定
   group_select: "🚀 节点选择"
   group_auto: "♻️ 自动选择"
+  # 额外的自动测速子组：纯净组只收最顶档（极度纯净），稳定组收稳定池节点；
+  # 组内为空时自动省略。节点名里带对应标签/「稳定」标记，子组据此收集。
+  group_clean: "✨ 纯净"
+  group_stable: "🛡️ 稳定节点"
   max_test_age_hours: 12 # 未轮到复测的节点，最近测活有效期
   # 旧版客户端内核遇到一个不认识的协议就拒绝整份订阅（"unsupport proxy type"），
   # 这些协议不测试也不输出。anytls 需 mihomo >= v1.19.2，mieru 需 >= v1.19.0。

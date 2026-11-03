@@ -264,8 +264,13 @@ class OutputAndConfigTests(unittest.TestCase):
         self.assertEqual(stats["total"], 3)
         self.assertEqual(doc["proxies"][0]["server"], "1.1.1.1")
         self.assertEqual(stats["tiers"][cfg["output"]["group_other"]], 2)
-        self.assertEqual(len(doc["proxy-groups"]), 2)
-        self.assertEqual(len(doc["proxy-groups"][1]["proxies"]), 3)
+        groups = {g["name"]: g for g in doc["proxy-groups"]}
+        # select + auto always; here low is 极度纯净 (clean) and high is stable.
+        self.assertEqual(list(groups)[:2], [cfg["output"]["group_select"], cfg["output"]["group_auto"]])
+        self.assertEqual(len(groups[cfg["output"]["group_auto"]]["proxies"]), 3)
+        self.assertEqual(len(groups[cfg["output"]["group_clean"]]["proxies"]), 1)
+        self.assertEqual(groups[cfg["output"]["group_stable"]]["proxies"], [doc["proxies"][0]["name"]])
+        self.assertIn("稳定", doc["proxies"][0]["name"])
         self.assertIn("未评分", text)
         self.assertNotIn("仅收录系数", text)
         mihomo.validate_subscription(EXE, text) if EXE.exists() else None
@@ -321,13 +326,21 @@ class OutputAndConfigTests(unittest.TestCase):
             elif line and not line.startswith("#"):
                 current.append(line)
         self.assertEqual(list(sections), ["[General]", "[Proxy Group]", "[Rule]"])
-        select, auto = sections["[Proxy Group]"]
-        g_select, g_auto = cfg["output"]["group_select"], cfg["output"]["group_auto"]
-        self.assertTrue(select.startswith(f"{g_select} = select,{g_auto},PROXY,"))
-        self.assertTrue(auto.startswith(f"{g_auto} = url-test,url={cfg['connectivity']['test_url']},"))
-        regex = dict(opt.split("=", 1) for opt in auto.split(" = ", 1)[1].split(",")[1:])["policy-regex-filter"]
+        g = cfg["output"]
+        g_select, g_auto, g_clean, g_stable = (g["group_select"], g["group_auto"], g["group_clean"], g["group_stable"])
+        by_name = {ln.split(" = ", 1)[0]: ln for ln in sections["[Proxy Group]"]}
+        self.assertEqual(list(by_name), [g_select, g_auto, g_clean, g_stable])
+        self.assertTrue(by_name[g_select].startswith(f"{g_select} = select,{g_auto},{g_clean},{g_stable},PROXY,"))
+        for name in (g_auto, g_clean, g_stable):
+            self.assertTrue(by_name[name].startswith(f"{name} = url-test,url={cfg['connectivity']['test_url']},"))
+
+        def filt(line):
+            return dict(opt.split("=", 1) for opt in line.split(" = ", 1)[1].split(",")[1:])["policy-regex-filter"]
+        regex = filt(by_name[g_auto])
         self.assertTrue(all(re.search(regex, name) for name in names), names)
-        self.assertFalse(any(re.search(regex, g) for g in (g_select, g_auto, "DIRECT", "PROXY")))
+        self.assertFalse(any(re.search(regex, x) for x in (g_select, g_auto, "DIRECT", "PROXY")))
+        self.assertEqual(filt(by_name[g_clean]), re.escape(cfg["purity"]["tiers"][0][2]))
+        self.assertEqual(filt(by_name[g_stable]), re.escape("稳定"))
         rules = sections["[Rule]"]
         self.assertIn(f"DOMAIN-SUFFIX,chatgpt.com,{g_select}", rules)
         self.assertEqual(rules[-2:], ["GEOIP,CN,DIRECT", f"FINAL,{g_select}"])
@@ -375,15 +388,42 @@ class OutputAndConfigTests(unittest.TestCase):
             cfg = config(); cfg["output"]["exclude_types"] = value
             with self.subTest(value=value), self.assertRaises(ValueError): validate_config(cfg)
 
-    def test_stable_nodes_remain_directly_selectable_without_extra_groups(self):
-        r = qualified(); r["stable"] = True
+    def test_stable_nodes_get_a_group_and_stay_directly_selectable(self):
+        r = qualified(); r["stable"] = True  # qualified() scores 5 -> 极度纯净 and stable
         text, stats = output.build_subscription([r], config())
         doc = yaml.safe_load(text)
-        self.assertEqual([g["name"] for g in doc["proxy-groups"]],
-                         [config()["output"]["group_select"], config()["output"]["group_auto"]])
-        self.assertEqual(doc["proxy-groups"][0]["type"], "select")
-        self.assertIn(doc["proxies"][0]["name"], doc["proxy-groups"][0]["proxies"])
+        g = config()["output"]
+        groups = {grp["name"]: grp for grp in doc["proxy-groups"]}
+        name = doc["proxies"][0]["name"]
+        self.assertIn("稳定", name)
+        self.assertEqual(groups[g["group_stable"]]["type"], "url-test")
+        self.assertEqual(groups[g["group_stable"]]["proxies"], [name])
+        self.assertEqual(groups[g["group_clean"]]["proxies"], [name])
+        # The curated groups and the node itself are all selectable in rule mode.
+        self.assertEqual(groups[g["group_select"]]["type"], "select")
+        self.assertEqual(groups[g["group_select"]]["proxies"],
+                         [g["group_auto"], g["group_clean"], g["group_stable"], name])
         self.assertEqual(stats["total"], 1)
+
+    def test_clean_group_collects_only_the_top_purity_tier(self):
+        cfg = config()
+        extreme = qualified("8.8.8.8")                                 # score 5 -> 极度纯净
+        pure = qualified("1.1.1.1"); pure["purity"]["score"] = 20      # 纯净
+        neutral = qualified("9.9.9.9"); neutral["purity"]["score"] = 30  # 中性
+        doc = yaml.safe_load(output.build_subscription([extreme, pure, neutral], cfg)[0])
+        groups = {g["name"]: g for g in doc["proxy-groups"]}
+        clean = groups[cfg["output"]["group_clean"]]["proxies"]
+        self.assertEqual(len(clean), 1)
+        self.assertTrue(all(cfg["purity"]["tiers"][0][2] in n for n in clean))
+        self.assertEqual(groups[cfg["output"]["group_auto"]]["proxies"].__len__(), 3)
+
+    def test_curated_groups_are_omitted_when_no_node_qualifies(self):
+        cfg = config()
+        r = qualified("8.8.8.8"); r["purity"]["score"] = 50  # 其他节点, not stable
+        doc = yaml.safe_load(output.build_subscription([r], cfg)[0])
+        self.assertEqual([g["name"] for g in doc["proxy-groups"]],
+                         [cfg["output"]["group_select"], cfg["output"]["group_auto"]])
+        self.assertNotIn("稳定", doc["proxies"][0]["name"])
 
     def test_tier_boundaries(self):
         tiers = config()["purity"]["tiers"]

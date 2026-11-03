@@ -80,20 +80,22 @@ class OutputDnsTests(unittest.TestCase):
     def test_rule_entry_defaults_to_auto_and_has_direct_manual_node_choices(self):
         doc, _, cfg = subscription()
         self.assertEqual(doc["mode"], "rule")
-        self.assertEqual(len(doc["proxy-groups"]), 2)
-        entry, group = doc["proxy-groups"]
+        g_select, g_auto, g_clean = (cfg["output"][k] for k in ("group_select", "group_auto", "group_clean"))
         names = [p["name"] for p in doc["proxies"]]
-        self.assertEqual(entry["name"], cfg["output"]["group_select"])
+        # The sample node scores 5 (极度纯净), so the clean subgroup appears; no stable node.
+        self.assertEqual([g["name"] for g in doc["proxy-groups"]], [g_select, g_auto, g_clean])
+        groups = {g["name"]: g for g in doc["proxy-groups"]}
+        entry = groups[g_select]
         self.assertEqual(entry["type"], "select")
-        self.assertEqual(entry["proxies"], [cfg["output"]["group_auto"], *names])
+        self.assertEqual(entry["proxies"], [g_auto, g_clean, *names])
         self.assertNotIn("DIRECT", entry["proxies"])
-        self.assertEqual(group["name"], cfg["output"]["group_auto"])
+        group = groups[g_auto]
         self.assertEqual(group["type"], "url-test")
         self.assertEqual(group["proxies"], names)
         self.assertNotIn(group["name"], group["proxies"])
         self.assertNotIn("DIRECT", group["proxies"])
         self.assertFalse(group["lazy"])
-        self.assertEqual(doc["rules"][-1], "MATCH," + entry["name"])
+        self.assertEqual(doc["rules"][-1], "MATCH," + g_select)
         self.assertEqual(route_for_cn_answer(doc["rules"], "example.org"), "DIRECT")
 
     def test_legacy_groups_migrate_without_changing_nodes_or_ports(self):
@@ -107,7 +109,8 @@ class OutputDnsTests(unittest.TestCase):
         migrated = yaml.safe_load(output.simplify_subscription(yaml.safe_dump(doc), cfg))
         self.assertEqual(migrated["proxies"], original_nodes)
         self.assertEqual(migrated["mixed-port"], 12345)
-        self.assertEqual(len(migrated["proxy-groups"]), 2)
+        # select + auto + the clean subgroup (the sample node is 极度纯净).
+        self.assertEqual(len(migrated["proxy-groups"]), 3)
         self.assertEqual(migrated["rules"][-1], "MATCH," + cfg["output"]["group_select"])
         self.assertNotIn("legacy-manual", yaml.safe_dump(migrated))
 
@@ -119,7 +122,8 @@ class OutputDnsTests(unittest.TestCase):
         self.assertEqual(output.simplify_subscription(migrated, cfg), migrated)
         restored = yaml.safe_load(migrated)
         self.assertEqual(restored["proxy-groups"][0]["type"], "select")
-        self.assertEqual(restored["proxy-groups"][0]["proxies"][1:], [p["name"] for p in doc["proxies"]])
+        names = [p["name"] for p in doc["proxies"]]
+        self.assertEqual(restored["proxy-groups"][0]["proxies"][-len(names):], names)
 
     def test_simplification_rejects_empty_or_ambiguous_node_names(self):
         doc, _, cfg = subscription()
