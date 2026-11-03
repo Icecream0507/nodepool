@@ -24,7 +24,7 @@ connectivity:
   concurrency: 32
 
 purity:
-  enabled: false        # 默认不查询 IPPure；已有评分仅展示参考
+  enabled: true         # 查询 IPPure 给节点评分并打档位标签（仅标注，不筛选）
   required: false       # 不以评分限制输出或稳定池晋升；高分/缺失/过期均可用
   api: "https://my.ippure.com/v1/info"
   max_score: 40          # 仅 required:true 时作为评分上限
