@@ -338,7 +338,7 @@ class OutputAndConfigTests(unittest.TestCase):
         for key in ("required", "enabled"):
             cfg = config(); cfg["purity"][key] = "false"
             with self.subTest(key=key), self.assertRaises(ValueError): validate_config(cfg)
-        cfg = config(); cfg["purity"]["required"] = True
+        cfg = config(); cfg["purity"].update(required=True, enabled=False)
         with self.assertRaises(ValueError): validate_config(cfg)
 
     def test_offline_validation_disables_dns_geoip_download(self):
@@ -436,6 +436,7 @@ class MainTests(unittest.TestCase):
         self.publisher.assert_not_called()
 
     def test_optional_high_missing_and_expired_scores_do_not_block_output(self):
+        self.cfg["purity"]["enabled"] = False
         for value in (None, {"score": 95, "ts": int(time.time())}, {"score": 5, "ts": 1}):
             with self.subTest(purity=value):
                 self.rec["purity"] = value
