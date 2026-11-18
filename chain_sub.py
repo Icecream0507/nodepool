@@ -168,6 +168,14 @@ def build_config(proxy: dict, name: str, provider_url: str, port: int = 7890,
     }
     if inline:
         del cfg["proxy-providers"]
+        # 机场的部分线路（实测良心云港/日线）连不上落地，但它们自身延迟最低，按前置测速会
+        # 一直选中死路。改为每个前置节点各配一份落地，url-test 直接测「前置+落地」整条链。
+        copies = [{**landing, "name": f"{name} ← {p['name']}", "dialer-proxy": p["name"]} for p in inline]
+        auto = {"name": f"⚡ 自动前置({front})", "type": "url-test", "proxies": [c["name"] for c in copies],
+                "url": HEALTH_URL, "interval": 300, "tolerance": 100, "lazy": False}
+        cfg["proxies"] = inline + copies
+        cfg["proxy-groups"] = [auto, {"name": GROUP_MAIN, "type": "select",
+                                      "proxies": [auto["name"], *auto["proxies"]]}]
     header = f"# 链式订阅: 本机 → {front} 出海 → {name} 落地\n# 由 chain_sub.py 生成，含明文账密，勿外传\n"
     header += "".join(f"# {line}\n" for line in notes or [])
     return header + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)

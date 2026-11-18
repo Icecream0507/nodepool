@@ -53,6 +53,25 @@ class BuildConfigTest(unittest.TestCase):
         self.assertEqual(cfg["proxies"][0]["dialer-proxy"], "出海(良心云)")
         self.assertIn("DOMAIN,air.example,DIRECT", cfg["rules"])
 
+    def test_local_front_tests_whole_chain(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "air.yaml"
+            src.write_text(yaml.safe_dump({"proxies": [
+                {"name": "剩余流量：1G", "type": "socks5", "server": "x", "port": 1},
+                {"name": "A", "type": "socks5", "server": "a", "port": 1}]}, allow_unicode=True),
+                encoding="utf-8")
+            cfg = yaml.safe_load(build_config(parse_proxy("1.2.3.4:9"), "JP", str(src),
+                                              front="lxy", exclude="剩余流量"))
+        self.assertNotIn("proxy-providers", cfg)
+        by_name = {p["name"]: p for p in cfg["proxies"]}
+        self.assertEqual(set(by_name), {"A", "JP ← A"})
+        self.assertEqual(by_name["JP ← A"]["dialer-proxy"], "A")
+        auto, main = cfg["proxy-groups"]
+        self.assertEqual((auto["type"], auto["proxies"]), ("url-test", ["JP ← A"]))
+        self.assertEqual((main["name"], main["proxies"][0]), (GROUP_MAIN, auto["name"]))
+
 
 if __name__ == "__main__":
     unittest.main()
