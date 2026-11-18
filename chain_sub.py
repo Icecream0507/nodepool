@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -116,9 +117,35 @@ def describe(info: dict) -> list[str]:
             f"运营商: {info.get('org') or '?'}"]
 
 
+def out_group(front: str = "freenode") -> str:
+    return GROUP_OUT if front == "freenode" else f"出海({front})"
+
+
 def build_config(proxy: dict, name: str, provider_url: str, port: int = 7890,
-                 notes: list[str] | None = None) -> str:
-    landing = {"name": name, **proxy, "dialer-proxy": GROUP_OUT}
+                 notes: list[str] | None = None, front: str = "freenode",
+                 exclude: str | None = None) -> str:
+    group_out = out_group(front)
+    landing = {"name": name, **proxy, "dialer-proxy": group_out}
+    out = {"name": group_out, "type": "url-test", "use": ["front"],
+           "url": HEALTH_URL, "interval": 300, "tolerance": 50}
+    if exclude:
+        # 机场订阅常带「剩余流量/套餐到期」之类的信息节点，不能进自动选择。
+        out["exclude-filter"] = exclude
+    inline = None
+    if Path(provider_url).is_file():
+        # 本地 Clash 配置（如客户端缓存的机场订阅）：节点直接内嵌，不再在线拉取。
+        pattern = re.compile(exclude) if exclude else None
+        inline = [p for p in yaml.safe_load(Path(provider_url).read_text(encoding="utf-8"))["proxies"]
+                  if not (pattern and pattern.search(p["name"]))]
+        if not inline:
+            raise ValueError(f"{provider_url} 里没有可用节点")
+        del out["use"]
+        out.pop("exclude-filter", None)
+        out["proxies"] = [p["name"] for p in inline]
+    host = None if inline else urlparse(provider_url).hostname
+    direct = ["DOMAIN-SUFFIX,githubusercontent.com,DIRECT", "DOMAIN-SUFFIX,github.com,DIRECT"]
+    if host and not any(host.endswith(d) for d in ("githubusercontent.com", "github.com")):
+        direct.append(f"DOMAIN,{host},DIRECT")
     cfg = {
         "mixed-port": port,
         "allow-lan": False,
@@ -126,23 +153,22 @@ def build_config(proxy: dict, name: str, provider_url: str, port: int = 7890,
         "log-level": "info",
         # 落地代理和免费节点都只走 IPv4，开着 IPv6 会让真实 IPv6 绕过代理泄露。
         "ipv6": False,
-        "proxy-providers": {"freenode": {
+        "proxy-providers": {"front": {
             "type": "http", "url": provider_url, "interval": 3600,
-            "path": "./providers/freenode.yaml",
+            "path": "./providers/freenode.yaml" if front == "freenode" else "./providers/front.yaml",
             "health-check": {"enable": True, "url": HEALTH_URL, "interval": 300},
         }},
-        "proxies": [landing],
+        "proxies": (inline or []) + [landing],
         "proxy-groups": [
-            {"name": GROUP_OUT, "type": "url-test", "use": ["freenode"],
-             "url": HEALTH_URL, "interval": 300, "tolerance": 50},
-            {"name": GROUP_MAIN, "type": "select", "proxies": [name, GROUP_OUT]},
+            out,
+            {"name": GROUP_MAIN, "type": "select", "proxies": [name, group_out]},
         ],
-        # 拉取 freenode 订阅必须直连：否则下载节点要先走链式、链式又要先有节点，形成死锁。
-        "rules": ["DOMAIN-SUFFIX,githubusercontent.com,DIRECT",
-                  "DOMAIN-SUFFIX,github.com,DIRECT",
-                  f"MATCH,{GROUP_MAIN}"],
+        # 拉取前置订阅必须直连：否则下载节点要先走链式、链式又要先有节点，形成死锁。
+        "rules": direct + [f"MATCH,{GROUP_MAIN}"],
     }
-    header = f"# 链式订阅: 本机 → freenode 出海 → {name} 落地\n# 由 chain_sub.py 生成，含明文账密，勿外传\n"
+    if inline:
+        del cfg["proxy-providers"]
+    header = f"# 链式订阅: 本机 → {front} 出海 → {name} 落地\n# 由 chain_sub.py 生成，含明文账密，勿外传\n"
     header += "".join(f"# {line}\n" for line in notes or [])
     return header + yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
 
@@ -250,7 +276,9 @@ def main(argv=None) -> int:
     ap.add_argument("--only", nargs="+", metavar="IP", help="配合 --offlineip，只处理这些 IP 或 proxy_id")
     ap.add_argument("--type", choices=["socks5", "http"], default="socks5", help="分段格式的协议，默认 socks5")
     ap.add_argument("--name", help="落地节点名，默认按 IP 归属自动生成")
-    ap.add_argument("--provider", help="出海节点订阅地址，默认用 freenode")
+    ap.add_argument("--provider", help="出海节点订阅地址（Clash 格式）或本地 Clash 配置文件（节点内嵌），默认用 freenode")
+    ap.add_argument("--front", default="freenode", help="前置名称，用于组名和区分链接，如 良心云")
+    ap.add_argument("--exclude", help="前置节点排除正则，如 '剩余流量|套餐到期'")
     ap.add_argument("--new", action="store_true", help="强制新建 gist，不复用旧链接")
     ap.add_argument("--no-test", action="store_true", help="跳过本地 mihomo 链路测试")
     ap.add_argument("--force", action="store_true", help="测试不通过也发布")
@@ -283,11 +311,13 @@ def main(argv=None) -> int:
 
 def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, extra: list[str]) -> int:
     key = f"{proxy['server']}:{proxy['port']}"
+    if args.front != "freenode":
+        key += f"|{args.front}"  # 换前置单独出一条链接，不覆盖 freenode 版
     info = lookup_ip(proxy["server"])
     label = "-".join(p for p in (info.get("country"), info.get("city")) if p) or "Proxy"
     name = name or f"{label}-{proxy['server']}"
     notes = describe(info) + extra
-    content = build_config(proxy, name, provider, notes=notes)
+    content = build_config(proxy, name, provider, notes=notes, front=args.front, exclude=args.exclude)
     print(f"落地节点: {name} ({proxy['type']})")
     for line in notes:
         print("  " + line)
@@ -297,7 +327,7 @@ def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, 
         if mihomo is None:
             print("未找到 bin/mihomo，跳过链路测试")
         else:
-            print("本地链路测试中（拉取 freenode 节点并经链路访问外网）…")
+            print(f"本地链路测试中（拉取 {args.front} 节点并经链路访问外网）…")
             exit_ip = test_chain(content, mihomo)
             try:
                 expected = socket.gethostbyname(proxy["server"])
@@ -321,7 +351,7 @@ def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, 
     if gid:
         data = _gist(token, "PATCH", gid, {"files": files})
     else:
-        data = _gist(token, "POST", payload={"description": f"chain sub {name}", "public": False, "files": files})
+        data = _gist(token, "POST", payload={"description": f"chain sub {name} via {args.front}", "public": False, "files": files})
         gid = data["id"]
     state[key] = gid
     STATE.parent.mkdir(parents=True, exist_ok=True)

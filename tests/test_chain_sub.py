@@ -35,15 +35,23 @@ class BuildConfigTest(unittest.TestCase):
         landing = cfg["proxies"][0]
         self.assertEqual(landing["dialer-proxy"], GROUP_OUT)
         self.assertFalse(cfg["ipv6"])
-        self.assertEqual(cfg["proxy-providers"]["freenode"]["url"], "https://e/x.yaml")
+        self.assertEqual(cfg["proxy-providers"]["front"]["url"], "https://e/x.yaml")
         groups = {g["name"]: g for g in cfg["proxy-groups"]}
-        self.assertEqual(groups[GROUP_OUT]["use"], ["freenode"])
+        self.assertEqual(groups[GROUP_OUT]["use"], ["front"])
         self.assertEqual(groups[GROUP_MAIN]["proxies"][0], "JP-x")
 
     def test_provider_download_bypasses_chain(self):
         rules = yaml.safe_load(build_config(parse_proxy("1.2.3.4:9"), "n", "https://e"))["rules"]
         self.assertTrue(rules[0].startswith("DOMAIN-SUFFIX,githubusercontent.com,DIRECT"))
         self.assertEqual(rules[-1], f"MATCH,{GROUP_MAIN}")
+
+    def test_custom_front(self):
+        cfg = yaml.safe_load(build_config(parse_proxy("1.2.3.4:9"), "n", "https://air.example/sub?t=1",
+                                          front="良心云", exclude="剩余流量|套餐到期"))
+        groups = {g["name"]: g for g in cfg["proxy-groups"]}
+        self.assertEqual(groups["出海(良心云)"]["exclude-filter"], "剩余流量|套餐到期")
+        self.assertEqual(cfg["proxies"][0]["dialer-proxy"], "出海(良心云)")
+        self.assertIn("DOMAIN,air.example,DIRECT", cfg["rules"])
 
 
 if __name__ == "__main__":
