@@ -2,7 +2,7 @@ import unittest
 
 import yaml
 
-from chain_sub import GROUP_MAIN, GROUP_OUT, build_config, parse_proxy
+from chain_sub import GROUP_MAIN, GROUP_OUT, build_config, expiry_date, landing_name, parse_proxy
 
 
 class ParseProxyTest(unittest.TestCase):
@@ -72,6 +72,21 @@ class BuildConfigTest(unittest.TestCase):
         auto, main = cfg["proxy-groups"]
         self.assertEqual((auto["type"], auto["proxies"]), ("url-test", ["JP ← A"]))
         self.assertEqual((main["name"], main["proxies"][0]), (GROUP_MAIN, auto["name"]))
+
+
+class ExpiryTest(unittest.TestCase):
+    def test_iso_timestamp_in_beijing_time(self):
+        self.assertEqual(expiry_date("2026-12-17T11:01:11.000Z"), "2026-12-17")
+        self.assertEqual(expiry_date("2026-12-17T20:00:00Z"), "2026-12-18")
+
+    def test_plain_and_missing(self):
+        self.assertEqual(expiry_date("2026-12-17"), "2026-12-17")
+        self.assertIsNone(expiry_date(None))
+        self.assertEqual(expiry_date("下月"), "下月")
+
+    def test_name(self):
+        self.assertEqual(landing_name("JP-x", "2026-12-17"), "JP-x | 到期2026-12-17")
+        self.assertEqual(landing_name("JP-x", None), "JP-x")
 
 
 if __name__ == "__main__":

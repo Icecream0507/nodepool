@@ -1,4 +1,7 @@
-"""把一个落地代理包装成「freenode 出海 → 落地代理」的链式 Clash 订阅，并发布到 secret gist。
+"""把一个落地代理包装成「前置出海 → 落地代理」的链式 Clash 订阅，并发布到 secret gist。
+
+前置默认用良心云机场（订阅地址放 .env 的 CHAIN_FRONT_URL，不进仓库），--front freenode 用免费节点池。
+落地节点名会带上到期日（OfflineIP 自动取，手动代理用 --expires），在客户端节点列表里直接可见。
 
 用法:
     python chain_sub.py "133.157.53.81:7077:user:pass"
@@ -18,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
@@ -38,6 +42,13 @@ STATE = ROOT / "data" / "chain-subs.json"
 GROUP_OUT = "出海(freenode)"
 GROUP_MAIN = "🎯 落地(链式)"
 HEALTH_URL = "https://cp.cloudflare.com/generate_204"
+# 前置预设：订阅地址读 .env；exclude 去掉机场的信息节点，include 只留实测能连上东京落地的线路
+# （良心云港/日/专线连不上落地，延迟却最低，不过滤的话自动选择会一直选中死路）。
+FRONTS = {
+    "良心云": {"env": "CHAIN_FRONT_URL", "exclude": "剩余流量|套餐到期",
+               "include": "新加坡高速|美国|英国|台湾"},
+}
+DEFAULT_FRONT = "良心云"
 SCHEMES = {"socks5": "socks5", "socks5h": "socks5", "socks": "socks5", "http": "http", "https": "http"}
 
 
@@ -97,10 +108,19 @@ LANGUAGES = {
 
 def lookup_ip(host: str) -> dict:
     """查询落地 IP 的位置、时区、运营商；失败返回空字典，不影响发布。"""
-    try:
-        ip = socket.gethostbyname(host)
-        info = requests.get(f"https://ipinfo.io/{ip}/json", timeout=10).json()
-    except (OSError, requests.RequestException, ValueError):
+    # ipinfo 常对代理出口 IP 限流(429)，查不到会让节点名退化成 Proxy-<ip>：先走系统代理，再直连。
+    for trust_env in (True, False, False):
+        try:
+            ip = socket.gethostbyname(host)
+            with requests.Session() as s:
+                s.trust_env = trust_env
+                info = s.get(f"https://ipinfo.io/{ip}/json", timeout=10).json()
+            if info.get("country"):
+                break
+        except (OSError, requests.RequestException, ValueError):
+            pass
+        time.sleep(1)
+    else:
         return {}
     info["language"] = LANGUAGES.get(info.get("country", ""))
     return info
@@ -206,8 +226,25 @@ def load_token() -> str:
     return token
 
 
-def offlineip_proxies(only: list[str] | None = None) -> list[tuple[dict, str | None, list[str]]]:
-    """从 OfflineIP 账号拉取生效中的静态 IP，返回 (proxy, 备注名, 附加说明)。"""
+def expiry_date(value: str | None) -> str | None:
+    """把到期时间（ISO 时间戳或日期）转成北京时间的 YYYY-MM-DD，解析不了原样返回。"""
+    if not value:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return value.strip()
+    if t.tzinfo:
+        t = t.astimezone(dt.timezone(dt.timedelta(hours=8)))
+    return t.date().isoformat()
+
+
+def landing_name(base: str, expires: str | None) -> str:
+    return f"{base} | 到期{expires}" if expires else base
+
+
+def offlineip_proxies(only: list[str] | None = None) -> list[tuple[dict, str | None, list[str], str | None]]:
+    """从 OfflineIP 账号拉取生效中的静态 IP，返回 (proxy, 备注名, 附加说明, 到期日)。"""
     from offlineip import DEFAULT_BASE, Client
     app_id, secret = env_value("OFFLINEIP_API_APP_ID"), env_value("OFFLINEIP_API_SECRET")
     if not app_id or not secret:
@@ -221,7 +258,8 @@ def offlineip_proxies(only: list[str] | None = None) -> list[tuple[dict, str | N
             continue
         extra = [f"类型: {item.get('ip_type_name') or '?'} / {item.get('line_name') or '?'}",
                  f"到期: {item.get('expires_at') or '?'}"]
-        result.append((parse_proxy(item["socks5_uri"]), item.get("note"), extra))
+        result.append((parse_proxy(item["socks5_uri"]), item.get("note"), extra,
+                       expiry_date(item.get("expires_at"))))
     return result
 
 
@@ -283,16 +321,18 @@ def test_chain(config_text: str, mihomo: Path, timeout: float = 60) -> str | Non
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="生成 freenode → 落地代理 的链式 Clash 订阅链接")
+    ap = argparse.ArgumentParser(description="生成 前置出海 → 落地代理 的链式 Clash 订阅链接")
     ap.add_argument("proxy", nargs="?", help="host:port:user:pass / socks5://... / http://...")
     ap.add_argument("--offlineip", action="store_true", help="从 OfflineIP 账号自动拉取所有生效中的静态 IP")
     ap.add_argument("--only", nargs="+", metavar="IP", help="配合 --offlineip，只处理这些 IP 或 proxy_id")
     ap.add_argument("--type", choices=["socks5", "http"], default="socks5", help="分段格式的协议，默认 socks5")
     ap.add_argument("--name", help="落地节点名，默认按 IP 归属自动生成")
-    ap.add_argument("--provider", help="出海节点订阅地址（Clash 格式）或本地 Clash 配置文件（节点内嵌），默认用 freenode")
-    ap.add_argument("--front", default="freenode", help="前置名称，用于组名和区分链接，如 良心云")
-    ap.add_argument("--exclude", help="前置节点排除正则，如 '剩余流量|套餐到期'")
-    ap.add_argument("--include", help="前置节点保留正则，只用能连上落地的线路，如 '新加坡高速|美国|英国|台湾'")
+    ap.add_argument("--front", default=DEFAULT_FRONT,
+                    help=f"前置名称，用于组名和区分链接；默认 {DEFAULT_FRONT}，freenode 为免费节点池")
+    ap.add_argument("--provider", help="前置订阅地址（Clash 格式）或本地 Clash 配置文件（节点内嵌），默认按 --front 预设")
+    ap.add_argument("--exclude", help="前置节点排除正则，默认按 --front 预设")
+    ap.add_argument("--include", help="前置节点保留正则（只用能连上落地的线路），默认按 --front 预设")
+    ap.add_argument("--expires", help="落地到期日（如 2026-12-17），显示在节点名里；--offlineip 自动获取")
     ap.add_argument("--new", action="store_true", help="强制新建 gist，不复用旧链接")
     ap.add_argument("--no-test", action="store_true", help="跳过本地 mihomo 链路测试")
     ap.add_argument("--force", action="store_true", help="测试不通过也发布")
@@ -310,26 +350,37 @@ def main(argv=None) -> int:
         print(f"OfflineIP: 找到 {len(jobs)} 个生效中的静态 IP")
     else:
         try:
-            jobs = [(parse_proxy(args.proxy, args.type), None, [])]
+            jobs = [(parse_proxy(args.proxy, args.type), None, [], expiry_date(args.expires))]
         except ValueError as exc:
             print(f"输入有误: {exc}", file=sys.stderr)
             return 2
     token = load_token()
-    provider = args.provider or provider_url(token)
+    preset = FRONTS.get(args.front, {})
+    args.exclude = args.exclude or preset.get("exclude")
+    args.include = args.include or preset.get("include")
+    if args.provider:
+        provider = args.provider
+    elif args.front == "freenode":
+        provider = provider_url(token)
+    else:
+        provider = env_value(preset.get("env", "CHAIN_FRONT_URL"))
+        if not provider:
+            raise SystemExit(f"缺少 {args.front} 订阅地址：在 .env 写 {preset.get('env', 'CHAIN_FRONT_URL')}=... 或用 --provider")
     failed = 0
-    for proxy, note, extra in jobs:
+    for proxy, note, extra, expires in jobs:
         print()
-        failed += publish_one(args, token, provider, proxy, args.name or note, extra) != 0
+        failed += publish_one(args, token, provider, proxy, args.name or note, extra, expires) != 0
     return 1 if failed else 0
 
 
-def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, extra: list[str]) -> int:
+def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, extra: list[str],
+                expires: str | None = None) -> int:
     key = f"{proxy['server']}:{proxy['port']}"
     if args.front != "freenode":
         key += f"|{args.front}"  # 换前置单独出一条链接，不覆盖 freenode 版
     info = lookup_ip(proxy["server"])
     label = "-".join(p for p in (info.get("country"), info.get("city")) if p) or "Proxy"
-    name = name or f"{label}-{proxy['server']}"
+    name = landing_name(name or f"{label}-{proxy['server']}", expires)
     notes = describe(info) + extra
     content = build_config(proxy, name, provider, notes=notes, front=args.front,
                            exclude=args.exclude, include=args.include)
@@ -366,7 +417,7 @@ def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, 
     if gid:
         data = _gist(token, "PATCH", gid, {"files": files})
     else:
-        data = _gist(token, "POST", payload={"description": f"chain sub {name} via {args.front}", "public": False, "files": files})
+        data = _gist(token, "POST", payload={"description": f"chain sub {key} via {args.front}", "public": False, "files": files})
         gid = data["id"]
     state[key] = gid
     STATE.parent.mkdir(parents=True, exist_ok=True)
