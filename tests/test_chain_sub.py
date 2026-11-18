@@ -47,9 +47,10 @@ class BuildConfigTest(unittest.TestCase):
 
     def test_custom_front(self):
         cfg = yaml.safe_load(build_config(parse_proxy("1.2.3.4:9"), "n", "https://air.example/sub?t=1",
-                                          front="良心云", exclude="剩余流量|套餐到期"))
+                                          front="良心云", exclude="剩余流量|套餐到期", include="新加坡"))
         groups = {g["name"]: g for g in cfg["proxy-groups"]}
         self.assertEqual(groups["出海(良心云)"]["exclude-filter"], "剩余流量|套餐到期")
+        self.assertEqual(groups["出海(良心云)"]["filter"], "新加坡")
         self.assertEqual(cfg["proxies"][0]["dialer-proxy"], "出海(良心云)")
         self.assertIn("DOMAIN,air.example,DIRECT", cfg["rules"])
 

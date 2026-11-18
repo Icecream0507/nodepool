@@ -123,7 +123,7 @@ def out_group(front: str = "freenode") -> str:
 
 def build_config(proxy: dict, name: str, provider_url: str, port: int = 7890,
                  notes: list[str] | None = None, front: str = "freenode",
-                 exclude: str | None = None) -> str:
+                 exclude: str | None = None, include: str | None = None) -> str:
     group_out = out_group(front)
     landing = {"name": name, **proxy, "dialer-proxy": group_out}
     out = {"name": group_out, "type": "url-test", "use": ["front"],
@@ -131,16 +131,21 @@ def build_config(proxy: dict, name: str, provider_url: str, port: int = 7890,
     if exclude:
         # 机场订阅常带「剩余流量/套餐到期」之类的信息节点，不能进自动选择。
         out["exclude-filter"] = exclude
+    if include:
+        # 只收能连上落地的线路（实测良心云港/日/专线连不上东京落地，延迟却最低）。
+        out["filter"] = include
     inline = None
     if Path(provider_url).is_file():
         # 本地 Clash 配置（如客户端缓存的机场订阅）：节点直接内嵌，不再在线拉取。
-        pattern = re.compile(exclude) if exclude else None
+        drop = re.compile(exclude) if exclude else None
+        keep = re.compile(include) if include else None
         inline = [p for p in yaml.safe_load(Path(provider_url).read_text(encoding="utf-8"))["proxies"]
-                  if not (pattern and pattern.search(p["name"]))]
+                  if not (drop and drop.search(p["name"])) and not (keep and not keep.search(p["name"]))]
         if not inline:
             raise ValueError(f"{provider_url} 里没有可用节点")
         del out["use"]
         out.pop("exclude-filter", None)
+        out.pop("filter", None)
         out["proxies"] = [p["name"] for p in inline]
     host = None if inline else urlparse(provider_url).hostname
     direct = ["DOMAIN-SUFFIX,githubusercontent.com,DIRECT", "DOMAIN-SUFFIX,github.com,DIRECT"]
@@ -287,6 +292,7 @@ def main(argv=None) -> int:
     ap.add_argument("--provider", help="出海节点订阅地址（Clash 格式）或本地 Clash 配置文件（节点内嵌），默认用 freenode")
     ap.add_argument("--front", default="freenode", help="前置名称，用于组名和区分链接，如 良心云")
     ap.add_argument("--exclude", help="前置节点排除正则，如 '剩余流量|套餐到期'")
+    ap.add_argument("--include", help="前置节点保留正则，只用能连上落地的线路，如 '新加坡高速|美国|英国|台湾'")
     ap.add_argument("--new", action="store_true", help="强制新建 gist，不复用旧链接")
     ap.add_argument("--no-test", action="store_true", help="跳过本地 mihomo 链路测试")
     ap.add_argument("--force", action="store_true", help="测试不通过也发布")
@@ -325,7 +331,8 @@ def publish_one(args, token: str, provider: str, proxy: dict, name: str | None, 
     label = "-".join(p for p in (info.get("country"), info.get("city")) if p) or "Proxy"
     name = name or f"{label}-{proxy['server']}"
     notes = describe(info) + extra
-    content = build_config(proxy, name, provider, notes=notes, front=args.front, exclude=args.exclude)
+    content = build_config(proxy, name, provider, notes=notes, front=args.front,
+                           exclude=args.exclude, include=args.include)
     print(f"落地节点: {name} ({proxy['type']})")
     for line in notes:
         print("  " + line)
